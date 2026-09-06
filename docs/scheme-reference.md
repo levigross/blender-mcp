@@ -1,8 +1,10 @@
 # Scheme binding reference
 
 `scheme_eval` is the only MCP tool. It accepts `code`, optional
-`timeout_secs`, optional `reset`, optional `include_events`, and optional
-`background`. Set `background: true` only from a client declaring the MCP tasks
+`session`, `timeout_secs`, `reset`, `include_events`, and `background`.
+Omitting `session` selects `default`; clients selecting the same session share
+its Scheme definitions and Blender scene. See [Sessions](sessions.md).
+Set `background: true` only from a client declaring the MCP tasks
 extension; see [Background MCP tasks](tasks.md) for polling and cancellation.
 
 This page lists the functions this server adds. For the Steel language itself see
@@ -11,6 +13,9 @@ including the behaviours worth knowing before you start, see
 `blender-mcp://reference/blender-api`.
 
 ## Results
+
+`structuredContent.session` identifies the selected session. Returned artifact
+metadata includes a `uri` that routes resource reads to its originating session.
 
 Every top-level expression contributes a value. One expression returns that
 value; several return a list of them, in order:
@@ -197,14 +202,14 @@ batch is neither a transaction nor a way to bypass per-operation access checks.
 ```
 
 `render-start` also accepts a settings hash with `filepath` and `timeout_secs`.
-`job-status`, `job-result`, and `job-cancel` work from another client connected to the
-same server. Job states are `queued`, `running`, `succeeded`, `failed`, `cancelled`,
+`job-status`, `job-result`, and `job-cancel` work from another client selecting the
+same Blender session. Job states are `queued`, `running`, `succeeded`, `failed`, `cancelled`,
 and `expired`. Request receipts can be inspected with `(request-status request-id
 [session-id])` and `(request-result request-id [session-id])` within the advertised
 retention window.
 
 `GET /healthz` uses the independent bridge control channel while Blender is busy.
-Scheme calls still enter the shared FIFO worker, so a status expression waits behind
+Scheme calls enter the selected session's FIFO worker, so a status expression waits behind
 an active synchronous `render!` evaluation. `render-start` releases that worker after
 submitting the job, allowing subsequent status evaluations during the render.
 While a render job is queued or running, ordinary Blender calls and additional

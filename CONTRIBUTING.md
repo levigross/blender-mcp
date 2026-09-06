@@ -17,8 +17,9 @@ formatting tools; compilation and tests run through Nix derivations.
 - `scripts`: launchers and packaged Blender/MCP integration checks.
 
 Keep Blender API execution on Blender's main thread. Scheme state belongs to
-the persistent worker and is shared by clients. Changes to either boundary
-should include regression coverage and update the relevant reference docs.
+one persistent worker per named session and is shared by clients selecting it.
+Changes to either boundary should include regression coverage and update the
+relevant reference docs.
 
 ## Build and verify
 

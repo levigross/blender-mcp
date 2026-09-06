@@ -16,7 +16,12 @@ use rmcp::{
 use schemars::JsonSchema;
 use serde::Deserialize;
 
-use crate::{resources, scheme::SchemeHandle, tasks::Tasks};
+use crate::{
+    resources,
+    scheme::SchemeHandle,
+    sessions::{DEFAULT_SESSION, Sessions, artifact_uri},
+    tasks::Tasks,
+};
 
 #[derive(Debug, Deserialize, JsonSchema)]
 #[serde(deny_unknown_fields)]
@@ -25,6 +30,10 @@ pub struct SchemeEvalParams {
         description = "Steel Scheme source to evaluate in the persistent Blender environment"
     )]
     pub code: String,
+    #[schemars(
+        description = "Named Blender session (default: default). Discover configured sessions at resources://blender/sessions. Clients selecting the same session share its Scheme state and scene."
+    )]
+    pub session: Option<String>,
     #[schemars(
         description = "Evaluation timeout in whole seconds (default 120, server maximum 3600)"
     )]
@@ -41,15 +50,19 @@ pub struct SchemeEvalParams {
 
 #[derive(Debug, Clone)]
 pub struct BlenderMcp {
-    worker: SchemeHandle,
+    sessions: Sessions,
     tool_router: ToolRouter<Self>,
     tasks: Tasks,
 }
 
 impl BlenderMcp {
     pub fn new(worker: SchemeHandle) -> Self {
+        Self::with_sessions(Sessions::new(worker))
+    }
+
+    pub fn with_sessions(sessions: Sessions) -> Self {
         Self {
-            worker,
+            sessions,
             tool_router: Self::tool_router(),
             tasks: Tasks::default(),
         }
@@ -67,7 +80,8 @@ impl BlenderMcp {
         Parameters(parameters): Parameters<SchemeEvalParams>,
         context: RequestContext<RoleServer>,
     ) -> Result<CallToolResult, McpError> {
-        evaluate_scheme(&self.worker, parameters, context.ct.clone()).await
+        let worker = self.sessions.get(parameters.session.as_deref())?;
+        evaluate_scheme(worker, parameters, context.ct.clone()).await
     }
 }
 
@@ -77,6 +91,7 @@ pub(crate) async fn evaluate_scheme(
     cancellation: tokio_util::sync::CancellationToken,
 ) -> Result<CallToolResult, McpError> {
     let timeout = parameters.timeout_secs.map(Duration::from_secs);
+    let session = parameters.session.as_deref().unwrap_or(DEFAULT_SESSION);
     match worker
         .evaluate(
             parameters.code,
@@ -88,12 +103,20 @@ pub(crate) async fn evaluate_scheme(
         .await
     {
         Ok(reply) => {
-            let structured = serde_json::to_value(&reply).map_err(|error| {
+            let mut structured = serde_json::to_value(&reply).map_err(|error| {
                 McpError::internal_error(
                     "failed to serialize scheme_eval response",
                     Some(serde_json::json!({"reason": error.to_string()})),
                 )
             })?;
+            structured["session"] = serde_json::json!(session);
+            if let Some(artifacts) = structured["artifacts"].as_array_mut() {
+                for artifact in artifacts {
+                    if let Some(id) = artifact["id"].as_str() {
+                        artifact["uri"] = serde_json::json!(artifact_uri(session, id));
+                    }
+                }
+            }
             let mut result = CallToolResult::structured(structured);
             result.content = vec![ContentBlock::text(reply.display.clone())];
             for artifact in reply.artifacts {
@@ -109,7 +132,7 @@ pub(crate) async fn evaluate_scheme(
                     result.content.push(ContentBlock::resource(
                         ResourceContents::blob(
                             artifact.data_base64,
-                            format!("blender-mcp://artifact/{}", artifact.id),
+                            artifact_uri(session, &artifact.id),
                         )
                         .with_mime_type(artifact.mime_type),
                     ));
@@ -118,12 +141,13 @@ pub(crate) async fn evaluate_scheme(
             Ok(result)
         }
         Err(error) => {
-            let structured = serde_json::to_value(&error).map_err(|serialization_error| {
+            let mut structured = serde_json::to_value(&error).map_err(|serialization_error| {
                 McpError::internal_error(
                     "failed to serialize scheme_eval error",
                     Some(serde_json::json!({"reason": serialization_error.to_string()})),
                 )
             })?;
+            structured["session"] = serde_json::json!(session);
             let mut result = CallToolResult::structured_error(structured);
             result.content = vec![ContentBlock::text(error.to_string())];
             Ok(result)
@@ -147,7 +171,7 @@ impl ServerHandler for BlenderMcp {
                 .with_title("Scheme-first Blender MCP"),
         )
         .with_instructions(
-            "Exactly one tool is exposed: scheme_eval. Read resources://blender for resource discovery, then blender-mcp://guide/getting-started and blender-mcp://reference/scheme. Scheme state and the Blender session are shared process-wide across HTTP clients. Start with (control-status) and (scene-summary); use RNA property/function metadata before unfamiliar edits. Clients declaring the tasks extension may pass background: true and poll tasks/get; see blender-mcp://guide/tasks. Use render-start and job-status/job-result for render jobs. On timeout inspect the request receipt before repeating a mutation. Reacquire handles after load/undo/restart. Check result_complete and display_truncated before treating output as complete."
+            "Exactly one tool is exposed: scheme_eval. Read resources://blender for resource discovery, then blender-mcp://guide/getting-started and blender-mcp://reference/scheme. Read resources://blender/sessions to discover configured Blender sessions. Pass session to scheme_eval to select one; omission selects default. Clients selecting the same session share Scheme variables and Blender state, with serialized evaluations. Different sessions have independent workers and Blender instances. Reset affects only the selected Scheme environment. Use each returned artifact URI to read from the correct session. Start with (control-status) and (scene-summary); use RNA property/function metadata before unfamiliar edits. Clients declaring the tasks extension may pass background: true and poll tasks/get; see blender-mcp://guide/tasks. Tasks retain their selected session across reconnects. Use render-start and job-status/job-result in the same session for render jobs. On timeout inspect the request receipt before repeating a mutation. Reacquire handles after load/undo/restart. Check result_complete and display_truncated before treating output as complete."
                 .to_owned(),
         )
     }
@@ -174,13 +198,14 @@ impl ServerHandler for BlenderMcp {
                     ),
                 ])));
             }
-            let parameters = serde_json::from_value(serde_json::Value::Object(
+            let parameters: SchemeEvalParams = serde_json::from_value(serde_json::Value::Object(
                 request.arguments.unwrap_or_default(),
             ))
             .map_err(|error| McpError::invalid_params(error.to_string(), None))?;
+            let worker = self.sessions.get(parameters.session.as_deref())?;
             return self
                 .tasks
-                .spawn(self.worker.clone(), parameters)
+                .spawn(worker.clone(), parameters)
                 .map(|task| CallToolResponse::Task(CreateTaskResult::new(task)));
         }
         self.tool_router
@@ -242,7 +267,7 @@ impl ServerHandler for BlenderMcp {
         _request: Option<PaginatedRequestParams>,
         _context: RequestContext<RoleServer>,
     ) -> impl Future<Output = Result<ListResourcesResult, McpError>> {
-        ready(Ok(resources::list(&self.worker)))
+        ready(Ok(resources::list_sessions(&self.sessions)))
     }
 
     async fn read_resource(
@@ -250,7 +275,7 @@ impl ServerHandler for BlenderMcp {
         request: ReadResourceRequestParams,
         context: RequestContext<RoleServer>,
     ) -> Result<ReadResourceResponse, McpError> {
-        resources::read(&request.uri, &self.worker, context.ct.clone())
+        resources::read_sessions(&request.uri, &self.sessions, context.ct.clone())
             .await
             .map(ReadResourceResponse::Complete)
     }
@@ -339,7 +364,8 @@ mod tests {
         let (server, worker) = test_server().await;
         let cancellation = tokio_util::sync::CancellationToken::new();
         server
-            .worker
+            .sessions
+            .default_worker()
             .evaluate(
                 "(define answer 42) answer".to_owned(),
                 None,
@@ -350,7 +376,8 @@ mod tests {
             .await
             .expect("define");
         let persisted = server
-            .worker
+            .sessions
+            .default_worker()
             .evaluate(
                 "answer".to_owned(),
                 None,
@@ -362,7 +389,8 @@ mod tests {
             .expect("persisted");
         assert_eq!(persisted.result, json!(42));
         let reset = server
-            .worker
+            .sessions
+            .default_worker()
             .evaluate("(+ 1 2)".to_owned(), None, true, false, cancellation)
             .await
             .expect("reset eval");
@@ -377,9 +405,10 @@ mod tests {
         let task = server
             .tasks
             .spawn(
-                server.worker.clone(),
+                server.sessions.default_worker().clone(),
                 SchemeEvalParams {
                     code: "(define cancelled-task-mutation 42)".to_owned(),
+                    session: None,
                     timeout_secs: None,
                     reset: None,
                     include_events: None,
@@ -407,7 +436,8 @@ mod tests {
         .expect("cancelled task settles");
         assert!(
             server
-                .worker
+                .sessions
+                .default_worker()
                 .evaluate(
                     "cancelled-task-mutation".to_owned(),
                     None,

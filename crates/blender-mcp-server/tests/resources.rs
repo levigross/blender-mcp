@@ -5,6 +5,7 @@ use blender_mcp_protocol::{BridgeOperation, BridgeResponse, OperatorCatalog, PRO
 use blender_mcp_server::{
     resources,
     scheme::{SchemeSettings, SchemeWorker},
+    sessions::Sessions,
 };
 use blender_mcp_transport::{BlenderBridge, BridgeHealth, BridgeMode, TransportError};
 use rmcp::model::{ErrorCode, ResourceContents};
@@ -152,11 +153,19 @@ async fn status_is_a_local_json_snapshot_without_blender_requests() {
 async fn artifact_templates_expand_to_readable_blobs_with_actual_mime() {
     let worker = worker().await;
     let templates = resources::templates().resource_templates;
-    assert_eq!(templates.len(), 2);
-    for template in templates {
+    let artifacts = templates
+        .into_iter()
+        .filter(|template| template.uri_template.ends_with("/artifact/{id}"))
+        .collect::<Vec<_>>();
+    assert_eq!(artifacts.len(), 3);
+    let sessions = Sessions::new(worker.handle());
+    for template in artifacts {
         assert!(template.mime_type.is_none(), "artifact MIME is not fixed");
-        let uri = template.uri_template.replace("{id}", "frame-1");
-        let result = resources::read(&uri, &worker.handle(), CancellationToken::new())
+        let uri = template
+            .uri_template
+            .replace("{id}", "frame-1")
+            .replace("{session}", "default");
+        let result = resources::read_sessions(&uri, &sessions, CancellationToken::new())
             .await
             .unwrap();
         assert_eq!(

@@ -6,7 +6,10 @@ use rmcp::{
     },
 };
 
-use crate::scheme::SchemeHandle;
+use crate::{
+    scheme::SchemeHandle,
+    sessions::{DEFAULT_SESSION, Sessions},
+};
 
 const MIME: &str = "text/markdown";
 
@@ -90,6 +93,12 @@ const ENTRIES: &[Entry] = &[
         description: "Background MCP evaluations, result polling, cancellation, and retention",
         content: include_str!("../../../docs/tasks.md"),
     },
+    Entry {
+        uri: "blender-mcp://guide/sessions",
+        name: "sessions-guide",
+        description: "Share a Blender scene between agents or route calls to independent sessions",
+        content: include_str!("../../../docs/sessions.md"),
+    },
 ];
 
 pub fn list(worker: &SchemeHandle) -> ListResourcesResult {
@@ -125,7 +134,101 @@ pub fn templates() -> ListResourceTemplatesResult {
             .with_description("Read an existing render artifact by its returned ID; MIME type comes from the artifact"),
         ResourceTemplate::new("resources://blender/artifact/{id}", "artifact-alias")
             .with_description("Alias for an existing render artifact; MIME type comes from the artifact"),
+        ResourceTemplate::new("resources://blender/sessions/{session}/artifact/{id}", "session-artifact")
+            .with_description("Read an artifact from the named Blender session that produced it"),
+        ResourceTemplate::new("resources://blender/sessions/{session}/runtime/status", "session-status")
+            .with_description("Local worker status for a configured Blender session")
+            .with_mime_type("application/json"),
+        ResourceTemplate::new("resources://blender/sessions/{session}/runtime/catalog", "session-catalog")
+            .with_description("Cached Blender catalog summary for a configured session")
+            .with_mime_type(MIME),
     ])
+}
+
+pub fn list_sessions(sessions: &Sessions) -> ListResourcesResult {
+    let mut listed = list(sessions.default_worker());
+    listed.resources.push(
+        Resource::new("resources://blender/sessions", "sessions")
+            .with_description(
+                "Configured Blender sessions and local worker status; no Blender calls",
+            )
+            .with_mime_type("application/json"),
+    );
+    for (name, _) in sessions.iter() {
+        for (suffix, mime) in [("status", "application/json"), ("catalog", MIME)] {
+            listed.resources.push(
+                Resource::new(
+                    format!("resources://blender/sessions/{name}/runtime/{suffix}"),
+                    format!("{name}-{suffix}"),
+                )
+                .with_mime_type(mime),
+            );
+        }
+    }
+    listed
+}
+
+pub async fn read_sessions(
+    uri: &str,
+    sessions: &Sessions,
+    cancellation: tokio_util::sync::CancellationToken,
+) -> Result<ReadResourceResult, McpError> {
+    let suffix = uri
+        .strip_prefix("resources://blender/")
+        .or_else(|| uri.strip_prefix("blender-mcp://"));
+    if suffix == Some("sessions") {
+        let entries = sessions
+            .iter()
+            .map(|(name, worker)| {
+                serde_json::json!({
+                    "name": name,
+                    "status": worker.status(),
+                    "blender_version": worker.catalog().blender_version,
+                    "runtime_status_uri": format!("resources://blender/sessions/{name}/runtime/status"),
+                    "catalog_uri": format!("resources://blender/sessions/{name}/runtime/catalog"),
+                })
+            })
+            .collect::<Vec<_>>();
+        let text = serde_json::to_string_pretty(&serde_json::json!({
+            "default_session": DEFAULT_SESSION,
+            "sessions": entries,
+        }))
+        .map_err(|error| McpError::internal_error(error.to_string(), None))?;
+        return Ok(ReadResourceResult::new(vec![
+            ResourceContents::text(text, uri).with_mime_type("application/json"),
+        ]));
+    }
+    if let Some(scoped) = suffix.and_then(|suffix| suffix.strip_prefix("sessions/")) {
+        let (session, resource) = scoped
+            .split_once('/')
+            .ok_or_else(|| McpError::invalid_params("session resource path is missing", None))?;
+        let worker = sessions.get(Some(session))?;
+        if !matches!(resource, "runtime/status" | "runtime/catalog")
+            && !resource.starts_with("artifact/")
+        {
+            return Err(McpError::invalid_params(
+                format!("unknown session resource URI: {uri}"),
+                None,
+            ));
+        }
+        let mut result = read(&format!("blender-mcp://{resource}"), worker, cancellation).await?;
+        for contents in &mut result.contents {
+            match contents {
+                ResourceContents::TextResourceContents { uri: returned, .. }
+                | ResourceContents::BlobResourceContents { uri: returned, .. } => {
+                    uri.clone_into(returned);
+                }
+                _ => {
+                    return Err(McpError::internal_error(
+                        "unsupported session resource contents",
+                        None,
+                    ));
+                }
+            }
+        }
+        return Ok(result);
+    }
+    read(uri, sessions.default_worker(), cancellation).await
 }
 
 pub async fn read(

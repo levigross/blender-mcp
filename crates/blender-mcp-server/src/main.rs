@@ -1,6 +1,7 @@
 //! Command-line entrypoint for the Scheme-first Blender MCP server.
 
 use std::{
+    collections::HashSet,
     net::SocketAddr,
     path::{Path, PathBuf},
     sync::Arc,
@@ -15,9 +16,11 @@ use blender_mcp_server::{
     http::{self, SecurityPolicy},
     scheme::{SchemeSettings, SchemeWorker},
     server::BlenderMcp,
+    sessions::{DEFAULT_SESSION, MAX_SESSIONS, Sessions, validate_name},
 };
 use blender_mcp_transport::{BlenderBridge, HeadlessBridge, HeadlessConfig, LiveBridge};
 use clap::{Parser, ValueEnum};
+use serde::Deserialize;
 use tokio_util::sync::CancellationToken;
 use tracing::{info, warn};
 
@@ -66,6 +69,10 @@ struct Cli {
     /// Optional `.blend` loaded before the headless bootstrap runs.
     #[arg(long)]
     blend_file: Option<PathBuf>,
+
+    /// JSON file describing additional named live or headless Blender sessions.
+    #[arg(long, env = "BLENDER_MCP_SESSIONS_FILE")]
+    sessions_file: Option<PathBuf>,
 
     /// Evaluation budget applied when `scheme_eval` omits `timeout_secs`.
     #[arg(long, default_value_t = 120, value_parser = clap::value_parser!(u64).range(1..))]
@@ -128,82 +135,277 @@ async fn run(cli: Cli) -> Result<()> {
     let token = load_token(cli.token_file.as_deref())?;
     let security = security_policy(&cli, token)?;
 
-    let bridge = connect_bridge(&cli).await?;
-    let catalog = initial_catalog(&bridge, cli.backend).await?;
-    info!(
-        blender = %catalog.blender_version,
-        operators = catalog.operators.len(),
-        revision = %catalog.revision,
-        "loaded Blender operator catalog"
-    );
-
-    let worker = SchemeWorker::spawn(
-        Arc::clone(&bridge),
-        catalog,
-        tokio::runtime::Handle::current(),
-        SchemeSettings {
-            default_timeout: Duration::from_secs(cli.default_timeout_secs),
-            maximum_timeout: Duration::from_secs(cli.maximum_timeout_secs),
-        },
-    )
-    .await
-    .map_err(|error| anyhow::anyhow!("failed to start the Steel worker: {error}"))?;
-
+    let configurations = session_configurations(&cli)?;
     let shutdown = CancellationToken::new();
-    let router = http::router(
-        BlenderMcp::new(worker.handle()),
-        Arc::clone(&bridge),
-        worker.handle(),
-        security,
-        &shutdown,
-        cli.max_body_bytes,
-    );
-
+    let _cancel_on_exit = shutdown.clone().drop_guard();
+    install_shutdown_listener(shutdown.clone()).await?;
+    // Bind before starting children so a busy port cannot leave background Blender running.
     let listener = tokio::net::TcpListener::bind(cli.bind)
         .await
         .with_context(|| format!("failed to bind {}", cli.bind))?;
     let address = listener
         .local_addr()
         .context("failed to read the bound address")?;
+    let running = start_sessions(&cli, configurations, &shutdown).await?;
+    let default = &running[0];
+    let mut sessions = Sessions::new(default.worker.handle());
+    for session in running.iter().skip(1) {
+        if let Err(error) = sessions.insert(session.name.clone(), session.worker.handle()) {
+            shutdown_sessions(running).await;
+            bail!("failed to register Blender session: {error}");
+        }
+    }
+
+    let router = http::router(
+        BlenderMcp::with_sessions(sessions),
+        Arc::clone(&default.bridge),
+        default.worker.handle(),
+        security,
+        &shutdown,
+        cli.max_body_bytes,
+    );
+
     info!(%address, "blender-mcp is serving POST /mcp and GET /healthz");
 
     let serve_shutdown = shutdown.clone();
     let served = axum::serve(listener, router)
         .with_graceful_shutdown(async move {
-            tokio::select! {
-                () = terminate_signal() => info!("received a termination signal; draining"),
-                () = serve_shutdown.cancelled() => {}
-            }
+            serve_shutdown.cancelled().await;
         })
         .await
         .context("the MCP HTTP service failed");
 
     shutdown.cancel();
-    worker.shutdown().await;
-    if let Err(error) = bridge.shutdown().await {
-        warn!(%error, "the Blender bridge did not shut down cleanly");
-    }
+    shutdown_sessions(running).await;
     served
 }
 
-async fn connect_bridge(cli: &Cli) -> Result<Arc<dyn BlenderBridge>> {
-    match cli.backend {
-        Backend::Live => {
-            info!(bridge = %cli.bridge, "using the live Blender bridge");
-            Ok(Arc::new(LiveBridge::new(cli.bridge)))
+#[derive(Debug, Deserialize)]
+#[serde(tag = "backend", rename_all = "lowercase", deny_unknown_fields)]
+enum SessionDefinition {
+    Live {
+        name: String,
+        bridge: SocketAddr,
+    },
+    Headless {
+        name: String,
+        #[serde(default)]
+        blend_file: Option<PathBuf>,
+    },
+}
+
+impl SessionDefinition {
+    fn name(&self) -> &str {
+        match self {
+            Self::Live { name, .. } | Self::Headless { name, .. } => name,
         }
-        Backend::Headless => {
-            let config = headless_config(cli)?;
-            info!(blender = %config.blender_executable.display(), "starting background Blender");
-            let bridge = HeadlessBridge::start(config)
-                .await
-                .context("failed to start background Blender")?;
-            Ok(Arc::new(bridge))
+    }
+}
+
+#[derive(Debug)]
+enum SessionBackend {
+    Live(SocketAddr),
+    Headless(HeadlessConfig),
+}
+
+#[derive(Debug)]
+struct SessionConfiguration {
+    name: String,
+    backend: SessionBackend,
+}
+
+fn session_configurations(cli: &Cli) -> Result<Vec<SessionConfiguration>> {
+    let (definitions, directory) = match &cli.sessions_file {
+        Some(path) => {
+            let bytes = std::fs::read(path)
+                .with_context(|| format!("failed to read sessions file {}", path.display()))?;
+            let definitions: Vec<SessionDefinition> = serde_json::from_slice(&bytes)
+                .with_context(|| format!("invalid sessions file {}", path.display()))?;
+            (definitions, path.parent().unwrap_or_else(|| Path::new(".")))
+        }
+        None => (Vec::new(), Path::new(".")),
+    };
+    prepare_sessions(cli, definitions, directory)
+}
+
+fn prepare_sessions(
+    cli: &Cli,
+    definitions: Vec<SessionDefinition>,
+    directory: &Path,
+) -> Result<Vec<SessionConfiguration>> {
+    if definitions.len() >= MAX_SESSIONS {
+        bail!("at most {MAX_SESSIONS} Blender sessions are allowed, including default");
+    }
+    let mut names = HashSet::from([DEFAULT_SESSION.to_owned()]);
+    let mut addresses = HashSet::new();
+    if cli.backend == Backend::Live {
+        register_live_address(&mut addresses, cli.bridge)?;
+    }
+    for definition in &definitions {
+        validate_name(definition.name()).map_err(anyhow::Error::msg)?;
+        if !names.insert(definition.name().to_owned()) {
+            bail!(
+                "duplicate or reserved Blender session name: {}",
+                definition.name()
+            );
+        }
+        if let SessionDefinition::Live { bridge, .. } = definition {
+            register_live_address(&mut addresses, *bridge)?;
+        }
+    }
+
+    let mut configurations = vec![SessionConfiguration {
+        name: DEFAULT_SESSION.to_owned(),
+        backend: match cli.backend {
+            Backend::Live => SessionBackend::Live(cli.bridge),
+            Backend::Headless => SessionBackend::Headless(headless_config(cli)?),
+        },
+    }];
+    for definition in definitions {
+        let name = definition.name().to_owned();
+        let backend = match definition {
+            SessionDefinition::Live { bridge, .. } => SessionBackend::Live(bridge),
+            SessionDefinition::Headless { blend_file, .. } => {
+                let blend_file = blend_file.map(|path| directory.join(path));
+                SessionBackend::Headless(headless_config_for(cli, blend_file)?)
+            }
+        };
+        configurations.push(SessionConfiguration { name, backend });
+    }
+    Ok(configurations)
+}
+
+fn register_live_address(addresses: &mut HashSet<SocketAddr>, address: SocketAddr) -> Result<()> {
+    let canonical = SocketAddr::new(address.ip().to_canonical(), address.port());
+    if !canonical.ip().is_loopback() {
+        bail!("live Blender bridge {address} must use a loopback address");
+    }
+    if !addresses.insert(canonical) {
+        bail!("multiple Blender sessions cannot use the same live bridge: {address}");
+    }
+    Ok(())
+}
+
+struct RunningSession {
+    name: String,
+    bridge: Arc<dyn BlenderBridge>,
+    worker: SchemeWorker,
+}
+
+async fn start_sessions(
+    cli: &Cli,
+    configurations: Vec<SessionConfiguration>,
+    shutdown: &CancellationToken,
+) -> Result<Vec<RunningSession>> {
+    let mut running = Vec::with_capacity(configurations.len());
+    for configuration in configurations {
+        match start_session(cli, configuration, shutdown).await {
+            Ok(session) => running.push(session),
+            Err(error) => {
+                shutdown_sessions(running).await;
+                return Err(error);
+            }
+        }
+    }
+    Ok(running)
+}
+
+async fn start_session(
+    cli: &Cli,
+    configuration: SessionConfiguration,
+    shutdown: &CancellationToken,
+) -> Result<RunningSession> {
+    if shutdown.is_cancelled() {
+        bail!("Blender startup cancelled");
+    }
+    let name = configuration.name;
+    let (bridge, backend): (Arc<dyn BlenderBridge>, _) = match configuration.backend {
+        SessionBackend::Live(address) => {
+            info!(session = %name, bridge = %address, "using the live Blender bridge");
+            (Arc::new(LiveBridge::new(address)), Backend::Live)
+        }
+        SessionBackend::Headless(config) => {
+            info!(session = %name, blender = %config.blender_executable.display(), "starting background Blender");
+            // HeadlessBridge owns its child before the first readiness await.
+            // Dropping this future kills the child and aborts its log pumps.
+            let bridge = tokio::select! {
+                biased;
+                () = shutdown.cancelled() => bail!("Blender startup cancelled"),
+                bridge = HeadlessBridge::start(config) => bridge,
+            }
+            .with_context(|| format!("failed to start background Blender for session {name}"))?;
+            (Arc::new(bridge), Backend::Headless)
+        }
+    };
+    let started = async {
+        let catalog = tokio::select! {
+            biased;
+            () = shutdown.cancelled() => bail!("Blender startup cancelled"),
+            catalog = initial_catalog(&bridge, backend) => catalog?,
+        };
+        info!(
+            session = %name,
+            blender = %catalog.blender_version,
+            operators = catalog.operators.len(),
+            revision = %catalog.revision,
+            "loaded Blender operator catalog"
+        );
+        // Worker initialization owns a native thread: let it finish so shutdown
+        // can join the thread, even when a signal arrives during initialization.
+        let worker = SchemeWorker::spawn(
+            Arc::clone(&bridge),
+            catalog,
+            tokio::runtime::Handle::current(),
+            SchemeSettings {
+                default_timeout: Duration::from_secs(cli.default_timeout_secs),
+                maximum_timeout: Duration::from_secs(cli.maximum_timeout_secs),
+            },
+        )
+        .await
+        .map_err(|error| {
+            anyhow::anyhow!("failed to start the Steel worker for session {name}: {error}")
+        })?;
+        if shutdown.is_cancelled() {
+            worker.shutdown().await;
+            bail!("Blender startup cancelled");
+        }
+        Ok(worker)
+    }
+    .await;
+    match started {
+        Ok(worker) => Ok(RunningSession {
+            name,
+            bridge,
+            worker,
+        }),
+        Err(error) => {
+            if let Err(shutdown_error) = bridge.shutdown().await {
+                warn!(session = %name, %shutdown_error, "failed to clean up the Blender bridge after startup failed");
+            }
+            Err(error)
+        }
+    }
+}
+
+async fn shutdown_sessions(sessions: Vec<RunningSession>) {
+    for session in sessions.into_iter().rev() {
+        session.worker.shutdown().await;
+        if let Err(error) = session.bridge.shutdown().await {
+            warn!(session = %session.name, %error, "the Blender bridge did not shut down cleanly");
         }
     }
 }
 
 fn headless_config(cli: &Cli) -> Result<HeadlessConfig> {
+    headless_config_for(cli, cli.blend_file.clone())
+}
+
+fn headless_config_for(cli: &Cli, blend_file: Option<PathBuf>) -> Result<HeadlessConfig> {
+    if let Some(path) = &blend_file
+        && !path.is_file()
+    {
+        bail!("Blender scene file {} does not exist", path.display());
+    }
     let extension_dir = cli.extension_dir.clone().context(
         "--extension-dir (or BLENDER_MCP_EXTENSION_DIR) must point at the installed scheme_blender_mcp directory",
     )?;
@@ -230,7 +432,7 @@ fn headless_config(cli: &Cli) -> Result<HeadlessConfig> {
         blender_executable: cli.blender.clone(),
         bootstrap_script: bootstrap,
         extension_dir,
-        blend_file: cli.blend_file.clone(),
+        blend_file,
         startup_timeout: Duration::from_secs(cli.startup_timeout_secs),
         maximum_frame_bytes: DEFAULT_MAX_FRAME_BYTES,
         log_level: cli.blender_log_level,
@@ -328,33 +530,48 @@ fn security_policy(cli: &Cli, token: Option<String>) -> Result<SecurityPolicy> {
     SecurityPolicy::new(hosts, origins, token).map_err(|message| anyhow::anyhow!(message))
 }
 
-async fn terminate_signal() {
-    let interrupt = async {
+async fn install_shutdown_listener(shutdown: CancellationToken) -> Result<()> {
+    #[cfg(unix)]
+    let signal = {
+        use tokio::signal::unix::{SignalKind, signal};
+        let mut interrupt =
+            signal(SignalKind::interrupt()).context("failed to listen for SIGINT")?;
+        let mut terminate =
+            signal(SignalKind::terminate()).context("failed to listen for SIGTERM")?;
+        async move {
+            tokio::select! {
+                _ = interrupt.recv() => {}
+                _ = terminate.recv() => {}
+            }
+        }
+    };
+    #[cfg(not(unix))]
+    let signal = async {
         if let Err(error) = tokio::signal::ctrl_c().await {
             warn!(%error, "failed to listen for Ctrl+C");
             std::future::pending::<()>().await;
         }
     };
 
-    #[cfg(unix)]
-    let terminate = async {
-        match tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate()) {
-            Ok(mut signal) => {
-                signal.recv().await;
+    let (ready_tx, ready_rx) = tokio::sync::oneshot::channel();
+    tokio::spawn(async move {
+        tokio::select! {
+            biased;
+            () = signal => {
+                info!("received a termination signal; draining");
+                shutdown.cancel();
             }
-            Err(error) => {
-                warn!(%error, "failed to listen for SIGTERM");
-                std::future::pending::<()>().await;
-            }
+            () = async {
+                // The biased select polls signal first, installing even lazy
+                // platform handlers before startup is allowed to spawn children.
+                let _ = ready_tx.send(());
+                shutdown.cancelled().await;
+            } => {}
         }
-    };
-    #[cfg(not(unix))]
-    let terminate = std::future::pending::<()>();
-
-    tokio::select! {
-        () = interrupt => {}
-        () = terminate => {}
-    }
+    });
+    ready_rx
+        .await
+        .context("termination signal interrupted startup")
 }
 
 fn initialize_tracing() {
@@ -460,5 +677,210 @@ mod tests {
             directory.path().to_str().expect("utf-8 path"),
         ]);
         assert!(headless_config(&missing).is_err());
+    }
+
+    fn live_definition(name: &str, port: u16) -> SessionDefinition {
+        SessionDefinition::Live {
+            name: name.to_owned(),
+            bridge: SocketAddr::from(([127, 0, 0, 1], port)),
+        }
+    }
+
+    #[tokio::test]
+    async fn startup_cancellation_interrupts_a_pending_catalog_request() {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bridge listener");
+        let address = listener.local_addr().expect("bridge address");
+        let shutdown = CancellationToken::new();
+        let task_shutdown = shutdown.clone();
+        let startup = tokio::spawn(async move {
+            start_session(
+                &cli(&["--backend", "live"]),
+                SessionConfiguration {
+                    name: "waiting".to_owned(),
+                    backend: SessionBackend::Live(address),
+                },
+                &task_shutdown,
+            )
+            .await
+        });
+        let connected = tokio::time::timeout(Duration::from_secs(3), listener.accept()).await;
+        // Keep the connection open without replying, simulating Blender stuck
+        // during startup, then cancel while its request is pending.
+        shutdown.cancel();
+        let result = tokio::time::timeout(Duration::from_secs(3), startup)
+            .await
+            .expect("startup cancellation does not wait for the catalog timeout")
+            .expect("startup joins");
+        assert!(connected.is_ok(), "startup contacted the bridge");
+        assert!(matches!(result, Err(error) if error.to_string().contains("startup cancelled")));
+    }
+
+    #[tokio::test]
+    async fn cancelled_startup_does_not_connect_to_the_next_session() {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bridge listener");
+        let shutdown = CancellationToken::new();
+        shutdown.cancel();
+        let result = start_sessions(
+            &cli(&["--backend", "live"]),
+            vec![SessionConfiguration {
+                name: "never-started".to_owned(),
+                backend: SessionBackend::Live(listener.local_addr().expect("address")),
+            }],
+            &shutdown,
+        )
+        .await;
+        assert!(result.is_err());
+        assert!(
+            tokio::time::timeout(Duration::from_millis(25), listener.accept())
+                .await
+                .is_err(),
+            "cancelled startup must not connect to another bridge"
+        );
+    }
+
+    #[test]
+    fn session_names_and_capacity_are_checked_before_startup() {
+        let cli = cli(&["--backend", "live", "--bridge", "127.0.0.1:9876"]);
+        for name in ["", "default", "../escape", "a b", "é"] {
+            assert!(
+                prepare_sessions(&cli, vec![live_definition(name, 9877)], Path::new(".")).is_err()
+            );
+        }
+        let too_long = "a".repeat(65);
+        assert!(
+            prepare_sessions(&cli, vec![live_definition(&too_long, 9877)], Path::new(".")).is_err()
+        );
+        assert!(
+            prepare_sessions(
+                &cli,
+                vec![live_definition("a", 9877), live_definition("a", 9878)],
+                Path::new(".")
+            )
+            .is_err()
+        );
+        let definitions = (0..15)
+            .map(|index| live_definition(&format!("game-{index}"), 9900 + index))
+            .collect();
+        assert_eq!(
+            prepare_sessions(&cli, definitions, Path::new("."))
+                .expect("capacity boundary")
+                .len(),
+            MAX_SESSIONS
+        );
+        let definitions = (0..16)
+            .map(|index| live_definition(&format!("game-{index}"), 9900 + index))
+            .collect();
+        assert!(prepare_sessions(&cli, definitions, Path::new(".")).is_err());
+    }
+
+    #[test]
+    fn duplicate_and_non_loopback_bridges_are_rejected() {
+        let cli = cli(&["--backend", "live", "--bridge", "127.0.0.1:9876"]);
+        assert!(
+            prepare_sessions(&cli, vec![live_definition("editor", 9876)], Path::new(".")).is_err()
+        );
+        assert!(
+            prepare_sessions(
+                &cli,
+                vec![live_definition("a", 9877), live_definition("b", 9877)],
+                Path::new(".")
+            )
+            .is_err()
+        );
+        for address in ["[::ffff:127.0.0.1]:9876", "192.0.2.1:9877"] {
+            let definition = SessionDefinition::Live {
+                name: "editor".to_owned(),
+                bridge: address.parse().expect("address"),
+            };
+            assert!(prepare_sessions(&cli, vec![definition], Path::new(".")).is_err());
+        }
+    }
+
+    #[test]
+    fn sessions_file_rejects_unknown_fields_and_invalid_backend_records() {
+        for document in [
+            r#"[{"name":"editor","backend":"live"}]"#,
+            r#"[{"name":"game","backend":"headless","bridge":"127.0.0.1:9877"}]"#,
+            r#"[{"name":"game","backend":"headless","blend_flie":"game.blend"}]"#,
+            r#"[{"name":"game","backend":"unknown"}]"#,
+        ] {
+            assert!(serde_json::from_str::<Vec<SessionDefinition>>(document).is_err());
+        }
+    }
+
+    #[test]
+    fn headless_sessions_resolve_scene_paths_without_inheriting_the_default_scene() {
+        let directory = tempfile::tempdir().expect("temporary directory");
+        let extension = directory.path().join("scheme_blender_mcp");
+        std::fs::create_dir(&extension).expect("extension directory");
+        std::fs::write(extension.join("blender_manifest.toml"), "").expect("manifest");
+        std::fs::write(directory.path().join("headless_bootstrap.py"), "").expect("bootstrap");
+        let default_scene = directory.path().join("default.blend");
+        let extra_scene = directory.path().join("extra.blend");
+        std::fs::write(&default_scene, "").expect("default scene");
+        std::fs::write(&extra_scene, "").expect("extra scene");
+        let configuration = directory.path().join("sessions.json");
+        std::fs::write(
+            &configuration,
+            r#"[
+            {"name":"game","backend":"headless","blend_file":"extra.blend"},
+            {"name":"scratch","backend":"headless"}
+        ]"#,
+        )
+        .expect("sessions file");
+        let cli = cli(&[
+            "--backend",
+            "headless",
+            "--extension-dir",
+            extension.to_str().expect("extension path"),
+            "--blend-file",
+            default_scene.to_str().expect("default path"),
+            "--sessions-file",
+            configuration.to_str().expect("configuration path"),
+            "--startup-timeout-secs",
+            "42",
+            "--blender-log-level",
+            "-1",
+        ]);
+        let sessions = session_configurations(&cli).expect("prepared sessions");
+        assert_eq!(
+            sessions
+                .iter()
+                .map(|session| session.name.as_str())
+                .collect::<Vec<_>>(),
+            ["default", "game", "scratch"]
+        );
+        for (session, expected_scene) in
+            sessions
+                .iter()
+                .zip([Some(default_scene), Some(extra_scene.clone()), None])
+        {
+            let SessionBackend::Headless(config) = &session.backend else {
+                panic!("headless session expected");
+            };
+            assert_eq!(config.blend_file, expected_scene);
+            assert_eq!(config.extension_dir, extension);
+            assert_eq!(config.startup_timeout, Duration::from_secs(42));
+            assert_eq!(config.log_level, -1);
+        }
+        let absolute = vec![SessionDefinition::Headless {
+            name: "absolute".to_owned(),
+            blend_file: Some(extra_scene.clone()),
+        }];
+        let prepared =
+            prepare_sessions(&cli, absolute, Path::new("unused")).expect("absolute scene");
+        let SessionBackend::Headless(config) = &prepared[1].backend else {
+            panic!("headless session expected");
+        };
+        assert_eq!(config.blend_file, Some(extra_scene));
+        let missing = vec![SessionDefinition::Headless {
+            name: "missing".to_owned(),
+            blend_file: Some(PathBuf::from("missing.blend")),
+        }];
+        assert!(prepare_sessions(&cli, missing, directory.path()).is_err());
     }
 }

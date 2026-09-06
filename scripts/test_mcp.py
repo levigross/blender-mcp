@@ -5,6 +5,7 @@ point accepts a packaged blender-mcp binary; no external Python packages are use
 """
 
 import base64
+from concurrent.futures import ThreadPoolExecutor
 import hashlib
 import json
 import os
@@ -30,7 +31,7 @@ class McpClient:
         self.calls = 0
         self.tasks = tasks
 
-    def rpc(self, method, params, name=None, expect_error=False):
+    def rpc(self, method, params, name=None, expect_error=False, expect_rpc_error=False):
         self.next_id += 1
         self.calls += 1
         params = dict(params)
@@ -61,7 +62,9 @@ class McpClient:
                 raw = response.read().decode()
         except urllib.error.HTTPError as error:
             detail = error.read(4096).decode(errors="replace")
-            raise AssertionError(f"{method}: HTTP {error.code}: {detail}") from error
+            if not expect_rpc_error or error.code != 400:
+                raise AssertionError(f"{method}: HTTP {error.code}: {detail}") from error
+            raw = detail
         if raw.lstrip().startswith("{"):
             reply = json.loads(raw)
         else:
@@ -74,42 +77,51 @@ class McpClient:
                 if any(line.startswith("data:") for line in event.splitlines())
             )
             reply = next(event for event in events if event.get("id") == self.next_id)
+        if expect_rpc_error:
+            assert "error" in reply, reply
+            return reply["error"]
         assert "error" not in reply, reply
         result = reply["result"]
         assert bool(result.get("isError")) == expect_error, result
         return result
 
-    def evaluate(self, code, expect_error=False):
+    def evaluate(self, code, expect_error=False, *, session=None, reset=False):
+        arguments = {"code": code}
+        if session is not None:
+            arguments["session"] = session
+        if reset:
+            arguments["reset"] = True
         result = self.rpc(
-            "tools/call", {"name": "scheme_eval", "arguments": {"code": code}},
+            "tools/call", {"name": "scheme_eval", "arguments": arguments},
             "scheme_eval", expect_error=expect_error,
         )
         if not expect_error:
             assert result["structuredContent"]["result_complete"], result
         return result
 
-    def value(self, code):
-        return self.evaluate(code)["structuredContent"]["result"]
+    def value(self, code, *, session=None):
+        return self.evaluate(code, session=session)["structuredContent"]["result"]
 
 
 class Server:
     """An isolated, owned process tree; also reused by the Nix benchmark."""
 
-    def __init__(self, binary):
+    def __init__(self, binary, *, sessions=None):
         self.binary = str(Path(binary).resolve())
         self.workspace = tempfile.TemporaryDirectory(prefix="blender-mcp-test-")
         self.root = Path(self.workspace.name)
         self.log = (self.root / "server.log").open("w+")
         self.process = None
+        self.sessions = sessions
 
-    def __enter__(self):
+    def start(self):
         with socket.socket() as listener:
             listener.bind(("127.0.0.1", 0))
             address = f"127.0.0.1:{listener.getsockname()[1]}"
         environment = dict(os.environ)
         for name in [
             "BLENDER_MCP_TOKEN", "BLENDER_MCP_BLENDER", "BLENDER_MCP_BOOTSTRAP",
-            "BLENDER_MCP_EXTENSION_DIR", "BLENDER_MCP_INSTANCE_ID",
+            "BLENDER_MCP_EXTENSION_DIR", "BLENDER_MCP_INSTANCE_ID", "BLENDER_MCP_SESSIONS_FILE",
         ]:
             environment.pop(name, None)
         environment.update({
@@ -118,14 +130,23 @@ class Server:
             "BLENDER_USER_SCRIPTS": str(self.root / "scripts"),
             "BLENDER_USER_EXTENSIONS": str(self.root / "extensions"),
         })
+        command = [self.binary, "--backend", "headless", "--bind", address,
+                   "--startup-timeout-secs", "90"]
+        if self.sessions is not None:
+            sessions_file = self.root / "sessions.json"
+            sessions_file.write_text(json.dumps(self.sessions))
+            command.extend(["--sessions-file", str(sessions_file)])
         self.process = subprocess.Popen(
-            [self.binary, "--backend", "headless", "--bind", address,
-             "--startup-timeout-secs", "90"],
+            command,
             env=environment, stdout=self.log, stderr=self.log,
             start_new_session=True,
         )
+        return address
+
+    def __enter__(self):
+        address = self.start()
         try:
-            deadline = time.monotonic() + 100
+            deadline = time.monotonic() + 100 * (1 + len(self.sessions or []))
             while time.monotonic() < deadline:
                 if self.process.poll() is not None:
                     raise RuntimeError("packaged server exited during startup")
@@ -372,6 +393,148 @@ def resources_and_tasks(client):
         raise AssertionError("background task did not finish")
 
 
+def multiplex(server):
+    client = server.client
+    other_client = McpClient(client.address)
+    assert [tool["name"] for tool in client.rpc("tools/list", {})["tools"]] == ["scheme_eval"]
+    uri = "resources://blender/sessions"
+    resource = client.rpc("resources/read", {"uri": uri}, uri)["contents"][0]
+    sessions = json.loads(resource["text"])
+    assert sessions["default_session"] == "default", sessions
+    assert {item["name"] for item in sessions["sessions"]} == {"default", "other"}, sessions
+    for session in ["default", "other"]:
+        for suffix in ["status", "catalog"]:
+            uri = f"resources://blender/sessions/{session}/runtime/{suffix}"
+            resource = client.rpc("resources/read", {"uri": uri}, uri)["contents"][0]
+            assert resource["uri"] == uri and resource["text"], resource
+
+    default_status = client.value("(control-status)")
+    other_status = client.value("(control-status)", session="other")
+    assert default_status["instance_id"] != other_status["instance_id"], (default_status, other_status)
+    for session, marker, name in [
+        ("default", 101, "MultiplexDefault"), ("other", 202, "MultiplexOther"),
+    ]:
+        result = client.evaluate(f'''
+            (define multiplex-marker {marker})
+            (define multiplex-cube (add-cube))
+            (rename! multiplex-cube "{name}")
+        ''', session=session)
+        assert result["structuredContent"]["session"] == session, result
+    # Two independent HTTP clients share one named Scheme worker and Blender scene.
+    assert other_client.value("multiplex-marker", session="other") == 202
+    assert other_client.value('(rna-get multiplex-cube "name")', session="other") == "MultiplexOther"
+    other_client.evaluate("(set-location! multiplex-cube 1 2 3)", session="other")
+    assert client.value("(object-location multiplex-cube)", session="other") == [1, 2, 3]
+
+    def increment(peer):
+        return peer.value('''(begin
+            (set! multiplex-marker (+ multiplex-marker 1))
+            multiplex-marker)''', session="other")
+
+    with ThreadPoolExecutor(max_workers=2) as executor:
+        futures = [executor.submit(increment, peer) for peer in [client, other_client]]
+        assert sorted(future.result() for future in futures) == [203, 204]
+    assert client.value("multiplex-marker") == 101
+    default_objects = client.value("(object-names)")
+    other_objects = client.value("(object-names)", session="other")
+    assert "MultiplexDefault" in default_objects and "MultiplexOther" not in default_objects, default_objects
+    assert "MultiplexOther" in other_objects and "MultiplexDefault" not in other_objects, other_objects
+    client.evaluate("(define other-only 909)", session="other")
+    client.evaluate("other-only", expect_error=True)
+    client.evaluate("(+ 1 2)", session="other", reset=True)
+    other_client.evaluate("multiplex-marker", expect_error=True, session="other")
+    assert client.value("multiplex-marker") == 101
+    assert "MultiplexOther" in client.value("(object-names)", session="other")
+
+    # A background render keeps its selected Blender and artifact store on reconnect.
+    other_client.evaluate('''
+        (define background-marker 717)
+        (set-engine! "CYCLES") (set-resolution! 16 16) (set-samples! 1)
+        (rna-set! (cycles-settings) "use_denoising" #f)
+        (rna-set! (cycles-settings) "device" "CPU")
+    ''', session="other")
+    capable = McpClient(client.address, tasks=True)
+    created = capable.rpc("tools/call", {"name": "scheme_eval", "arguments": {
+        "code": "(begin (render!) background-marker)", "session": "other", "background": True,
+    }}, "scheme_eval")
+    assert created["resultType"] == "task", created
+    reconnected = McpClient(client.address, tasks=True)
+    deadline = time.monotonic() + 90
+    while time.monotonic() < deadline:
+        task = reconnected.rpc("tasks/get", {"taskId": created["taskId"]}, created["taskId"])
+        if task["status"] == "completed":
+            break
+        assert task["status"] == "working", task
+        time.sleep(0.05)
+    else:
+        raise TimeoutError("multiplex background render did not finish")
+    result = task["result"]
+    assert not result.get("isError"), result
+    structured = result["structuredContent"]
+    assert structured["session"] == "other" and structured["result"] == 717, structured
+    artifact = structured["artifacts"][0]
+    uri = f'resources://blender/sessions/other/artifact/{artifact["id"]}'
+    assert artifact["uri"] == uri, artifact
+    image = next(block for block in result["content"] if block["type"] == "image")
+    image_bytes = base64.b64decode(image["data"], validate=True)
+    assert image_bytes.startswith(b"\x89PNG\r\n\x1a\n"), image
+    resource = reconnected.rpc("resources/read", {"uri": uri}, uri)["contents"][0]
+    assert resource["uri"] == uri and resource["mimeType"] == "image/png", resource
+    assert base64.b64decode(resource["blob"], validate=True) == image_bytes
+    for prefix in ["resources://blender/sessions/default/artifact/", "blender-mcp://artifact/"]:
+        wrong_uri = prefix + artifact["id"]
+        error = reconnected.rpc("resources/read", {"uri": wrong_uri}, wrong_uri, expect_rpc_error=True)
+        assert error["code"] == -32602 and "artifact_missing" in error["message"], error
+    assert client.value("multiplex-marker") == 101
+    client.evaluate("background-marker", expect_error=True)
+    print("PASS: multiplexed clients, isolated Blender sessions, scoped reset, background tasks, and artifact routing")
+
+
+def startup_shutdown(binary):
+    # Stall the second session's discovery after the first Blender has started.
+    with socket.socket() as bridge:
+        bridge.bind(("127.0.0.1", 0))
+        bridge.listen(1)
+        bridge.settimeout(0.2)
+        address = f"127.0.0.1:{bridge.getsockname()[1]}"
+        server = Server(binary, sessions=[{"name": "stalled", "backend": "live", "bridge": address}])
+        try:
+            server.start()
+            deadline = time.monotonic() + 100
+            while time.monotonic() < deadline:
+                assert server.process.poll() is None, "server exited before second-session discovery"
+                try:
+                    connection, _ = bridge.accept()
+                    break
+                except TimeoutError:
+                    pass
+            else:
+                raise TimeoutError("server did not reach second-session discovery")
+            with connection:
+                pid = server.process.pid
+                children = Path(f"/proc/{pid}/task/{pid}/children").read_text().split()
+                assert children, "default headless Blender was not running before interrupted startup"
+                # Only the server receives SIGTERM; it must stop and reap its children.
+                server.process.send_signal(signal.SIGTERM)
+                assert server.process.wait(timeout=15) in {0, 1}, "server did not handle SIGTERM"
+                remaining = [child for child in children if Path(f"/proc/{child}").exists()]
+                assert not remaining, f"Blender children survived interrupted startup: {remaining}"
+        except BaseException:
+            if server.process is not None:
+                try:
+                    os.killpg(server.process.pid, signal.SIGKILL)
+                except ProcessLookupError:
+                    pass
+                server.process.wait(timeout=15)
+            server.log.seek(0)
+            print(server.log.read()[-12000:], file=sys.stderr)
+            raise
+        finally:
+            server.log.close()
+            server.workspace.cleanup()
+    print("PASS: SIGTERM during multi-session startup stops and reaps earlier Blender children")
+
+
 def main():
     with Server(sys.argv[1]) as server:
         basic_scene(server.client)
@@ -397,6 +560,9 @@ def main():
         check(output_budget, server.client)
         assert not failures, "\n".join(failures)
         print("PASS: packaged MCP, resources, tasks, persistence, discovery, batch, snapshots, immutable artifacts, jobs, and epochs")
+    with Server(sys.argv[1], sessions=[{"name": "other", "backend": "headless"}]) as server:
+        multiplex(server)
+    startup_shutdown(sys.argv[1])
 
 
 if __name__ == "__main__":

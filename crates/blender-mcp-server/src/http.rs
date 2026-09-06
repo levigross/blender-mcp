@@ -101,8 +101,8 @@ pub fn router(
         .with_allowed_origins(security.allowed_origins())
         .with_max_request_body_bytes(maximum_body_bytes)
         .with_cancellation_token(shutdown.child_token());
-    // Stateless requests call this factory per request, so every clone must share the one
-    // process-wide Steel worker. Building a worker here would discard persistent Scheme state.
+    // Stateless requests call this factory per request, so every clone must share the
+    // session registry and tasks. Building workers here would discard persistent Scheme state.
     let mcp = StreamableHttpService::new(
         move || Ok::<_, std::io::Error>(handler.clone()),
         Arc::new(NeverSessionManager::default()),

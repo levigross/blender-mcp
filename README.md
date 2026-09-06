@@ -2,8 +2,8 @@
 
 `blender-mcp` is a Scheme-first MCP server for Blender. It exposes exactly one
 MCP tool, `scheme_eval`, and provides Blender operators and RNA access as Steel
-Scheme functions. One persistent, FIFO-serialized Steel environment is shared
-by all HTTP clients until reset or server restart.
+Scheme functions. Each named Blender session has a persistent, FIFO-serialized
+Steel environment shared by clients selecting that session until reset or restart.
 
 The project supports a live Blender extension and a server-managed headless
 Blender process. The default HTTP endpoint is Streamable HTTP at
@@ -74,6 +74,19 @@ Available `packages.${system}` outputs include:
 | `blender-extension` | Blender extension directory and installable ZIP. |
 | `blender` / `blender-cpu` | The corresponding pinned Blender runtime. |
 | `distribution` | CUDA server, extension, documentation, and examples. |
+
+## Multiple agents and Blender instances
+
+Agents selecting the same session share its scene and Scheme definitions, with
+serialized evaluations. Independent sessions have separate Blender instances and
+workers and can progress concurrently behind the same `/mcp` endpoint.
+
+Existing commands configure the `default` session. Add `--sessions-file sessions.json`
+to configure additional headless or live sessions, then pass `session: "assets"`
+alongside `code` to `scheme_eval`. Read `resources://blender/sessions` to discover
+names, and use the returned artifact URIs to read from the correct session.
+See [Shared and independent sessions](docs/sessions.md) for configuration and
+coordination rules.
 
 ## Connecting an MCP client
 

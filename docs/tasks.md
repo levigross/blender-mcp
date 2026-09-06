@@ -62,12 +62,15 @@ which uses `tasks/get`, `tasks/update`, and `tasks/cancel`. The older
   A running Blender operator may continue; its tool error preserves
   `potentially_continuing` and request receipts so you can inspect before retrying.
 - Tasks survive HTTP disconnects and can be polled by a reconnected authorized
-  client. They share the same single-user Scheme environment and FIFO execution
-  queue as synchronous calls. They do not run Blender operations concurrently.
+  client. Pass `session` to select a configured Blender session at admission;
+  omission selects `default`. Tasks retain that selection across reconnects and
+  share its Scheme environment and FIFO queue with synchronous calls. Different
+  sessions can progress concurrently; calls within a session remain serialized.
 - At most 32 task records, including retained results, are admitted. The task
   TTL is the evaluation timeout plus five minutes; completion is retained for
   one further TTL window by the SDK. Expired records are swept on task requests.
-  The server rejects new tasks when retained capacity is exhausted.
+  The limit is shared across sessions. The server rejects new tasks when retained
+  capacity is exhausted.
 - State is held in memory and ends on server restart. Saving a `.blend` does not
   save tasks or Scheme definitions. Resource and task access use the same HTTP
   authorization as tool calls; this is a shared single-user service.

@@ -229,6 +229,7 @@ async fn tools_list_exposes_exactly_scheme_eval() {
         .expect("scheme_eval declares an object schema");
     for property in [
         "code",
+        "session",
         "timeout_secs",
         "reset",
         "include_events",

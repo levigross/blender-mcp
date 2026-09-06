@@ -11,6 +11,7 @@ Read `resources://blender` for this index. MCP clients discover guides with
 | `resources://blender/guide/live` | Work with an interactive Blender session |
 | `resources://blender/guide/headless` | Run a server-managed background Blender process |
 | `resources://blender/guide/tasks` | Run background evaluations, poll results, and cancel tasks |
+| `resources://blender/guide/sessions` | Share scenes between agents and select independent Blender instances |
 | `resources://blender/guide/security` | Understand trust boundaries and HTTP exposure |
 | `resources://blender/reference/scheme` | Discover available Scheme bindings |
 | `resources://blender/reference/stdlib` | Use modeling, transform, node, and render helpers |
@@ -24,6 +25,12 @@ the RNA reference and inspect property or function metadata with `scheme_eval`.
 
 ## Runtime and artifacts
 
+- `resources://blender/sessions`: JSON list of configured session names and local
+  worker status. Each session also exposes
+  `resources://blender/sessions/{session}/runtime/status`,
+  `resources://blender/sessions/{session}/runtime/catalog`, and
+  `resources://blender/sessions/{session}/artifact/{id}`. Read each returned
+  artifact's `uri` to select the correct session. See [Sessions](sessions.md).
 - `resources://blender/runtime/catalog`: Markdown summary of the cached Blender
   version, operator count, catalog revision, and protocol version.
 - `resources://blender/runtime/status`: JSON snapshot containing the local Scheme
@@ -35,6 +42,8 @@ the RNA reference and inspect property or function metadata with `scheme_eval`.
   The resource contains a base64 blob with the artifact's MIME type. Reading an
   artifact does not start a render. IDs contain only ASCII letters, digits, and
   hyphens, with a maximum of 128 characters.
+
+Unqualified runtime and artifact URIs address the `default` session.
 
 Resource reads provide documentation, local runtime information, or existing
 artifacts. Run Blender operations through `scheme_eval`; the task guide describes
