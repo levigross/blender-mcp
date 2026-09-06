@@ -1,0 +1,65 @@
+# Supply-chain policy for the blender-mcp workspace.
+#
+# Run with `cargo deny check` (the flake development shell provides cargo-deny).
+
+[graph]
+# Release binaries target Linux; evaluating every platform would flag crates that
+# are never linked here, such as the UEFI-only `r-efi`.
+targets = [
+  "x86_64-unknown-linux-gnu",
+  "aarch64-unknown-linux-gnu",
+]
+all-features = true
+
+[advisories]
+# Vulnerabilities and yanked crates are hard failures. The entries below are all
+# `unmaintained` notices with no safe upgrade available, and every one is reached
+# only through `steel-core 0.8.3`. They are listed individually on purpose: a new
+# advisory against any other crate still fails the check.
+yanked = "deny"
+ignore = [
+  { id = "RUSTSEC-2025-0141", reason = "bincode 1.3.3 via steel-core; development permanently ceased, 1.3.3 is the final version" },
+  { id = "RUSTSEC-2026-0247", reason = "bitmaps 2.1.0 via steel-core -> im-rc; upstream repository archived 2026-05-03" },
+  { id = "RUSTSEC-2026-0250", reason = "im-rc 15.1.0 via steel-core; upstream repository archived 2026-05-03" },
+  { id = "RUSTSEC-2026-0251", reason = "sized-chunks 0.6.5 via steel-core -> im-rc; upstream repository archived 2026-05-03" },
+]
+
+[licenses]
+# The server crates are Apache-2.0. The Blender extension is GPL-3.0-or-later,
+# because it is loaded into Blender's process and is therefore a derived work --
+# that covers both its Python and `blender-mcp-native`. See `exceptions` below:
+# GPL is permitted for that one crate and rejected everywhere else, so a GPL
+# dependency cannot reach the Apache-2.0 server without this file changing.
+allow = [
+  "Apache-2.0",
+  "Apache-2.0 WITH LLVM-exception",
+  "BSD-2-Clause",
+  "BSD-3-Clause",
+  "BSL-1.0",
+  "BlueOak-1.0.0",
+  "ISC",
+  "MIT",
+  # File-level weak copyleft, reached through steel-core (im-rc, sized-chunks,
+  # bitmaps). Linking into an Apache-2.0 binary is permitted; if any of those files
+  # are ever modified, those modifications must be published under MPL-2.0.
+  "MPL-2.0",
+  "Unicode-3.0",
+  "Unlicense",
+  "Zlib",
+]
+confidence-threshold = 0.9
+
+# Scoped to this crate alone. Apache-2.0 is one-way compatible with GPL-3.0, so the
+# native module may link `blender-mcp-protocol`; the reverse is what must not happen.
+exceptions = [
+  { name = "blender-mcp-native", allow = ["GPL-3.0-or-later"] },
+]
+
+[bans]
+multiple-versions = "warn"
+wildcards = "deny"
+
+[sources]
+unknown-registry = "deny"
+unknown-git = "deny"
+allow-registry = ["https://github.com/rust-lang/crates.io-index"]

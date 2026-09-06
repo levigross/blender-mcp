@@ -1,0 +1,23 @@
+/target/
+/result
+/result-*
+/.direnv/
+/.env
+/.env.*
+!/examples/.env.example
+*.blend1
+*.pyc
+__pycache__/
+# The native bridge module is built only by Nix
+# and copied into the extension; it is never a source file.
+/blender_extension/scheme_blender_mcp/*.so
+.pytest_cache/
+.ruff_cache/
+
+# Local working notes and scene output are not project source.
+/PLAN.md
+/.codex/
+/artwork/
+/codex-session-*.md
+/run1.md
+/run2.md

@@ -1,0 +1,34 @@
+[package]
+name = "blender-mcp-native"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+repository.workspace = true
+# This module is loaded into Blender's own process, so it is a derived work of
+# Blender and carries Blender's licence rather than the workspace's Apache-2.0.
+# Apache-2.0 is one-way compatible with GPL-3.0, so linking the protocol crate is fine.
+license = "GPL-3.0-or-later"
+description = "Rust implementation of the Blender-side bridge, loaded by Blender's Python"
+
+[lib]
+name = "scheme_blender_mcp_native"
+crate-type = ["cdylib", "rlib"]
+
+[features]
+# `extension-module` stops PyO3 linking libpython, which is required for a module
+# loaded into an existing interpreter but makes the test harness unlinkable. Tests
+# therefore run with `--no-default-features`.
+default = ["extension-module"]
+extension-module = ["pyo3/extension-module"]
+
+[dependencies]
+blender-mcp-protocol = { path = "../blender-mcp-protocol", version = "0.1.0" }
+serde_json = { workspace = true }
+# abi3-py311 so a single artifact works across CPython 3.11+ rather than pinning
+# whichever interpreter this Blender happens to embed.
+pyo3 = { version = "0.29", features = ["abi3-py311"] }
+sha2 = { workspace = true }
+base64 = "0.22"
+
+[lints]
+workspace = true

@@ -1,0 +1,16 @@
+schema_version = "1.0.0"
+id = "scheme_blender_mcp"
+version = "0.1.0"
+name = "Scheme Blender MCP Bridge"
+tagline = "Expose Blender RNA to the local Scheme MCP server"
+maintainer = "blender-mcp contributors"
+type = "add-on"
+website = "https://github.com/levigross/blender-mcp"
+tags = ["Pipeline"]
+blender_version_min = "4.2.0"
+license = ["SPDX:GPL-3.0-or-later"]
+
+[permissions]
+network = "Listens on loopback for the local blender-mcp server"
+files = "Blender operators invoked by the user can read and write files"
+
