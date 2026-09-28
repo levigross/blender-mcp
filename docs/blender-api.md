@@ -280,7 +280,8 @@ many scalar calls in one `scheme_eval` still incurs those bridge round trips. Pr
 in order:
 
 1. A node graph or modifier that expresses the result declaratively.
-2. `foreach_set` for bulk numeric data.
+2. `mesh-from-data!` to create a mesh from vertices and faces in one call, or
+   `foreach_set` for bulk numeric data on existing geometry.
 3. `(batch! commands)` for up to 100 independent typed operations per bridge request.
 4. Individual RNA calls where each step depends on the previous result.
 

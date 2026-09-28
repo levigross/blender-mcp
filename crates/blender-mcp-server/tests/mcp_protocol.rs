@@ -76,6 +76,17 @@ impl BlenderBridge for MockBridge {
             BridgeOperation::RnaItems { offset, limit, .. } => {
                 json!({"offset": offset, "limit": limit})
             }
+            BridgeOperation::MeshFromData {
+                name,
+                vertices,
+                faces,
+                collection,
+                ..
+            } => json!({"name": name, "vertices": vertices, "faces": faces,
+                        "collection": collection.map(|reference| reference.id)}),
+            BridgeOperation::IdPropertySet { key, value, .. } => {
+                json!({"key": key, "value": value})
+            }
             BridgeOperation::Render { .. } => json!({"artifact": {
                 "id": "frame", "name": "frame.png", "mime_type": "image/png", "path": "/tmp/frame.png"
             }}),
@@ -540,6 +551,44 @@ async fn resources_list_and_read_round_trip() {
     );
 
     client.cancel().await.expect("client closes");
+    server.shutdown().await;
+}
+
+#[tokio::test]
+async fn build_bindings_send_typed_payloads_and_reject_malformed_geometry() {
+    let server = TestServer::start().await;
+
+    let mesh = evaluate(
+        &server,
+        r#"(mesh-from-data! "Tri" (list (list 0 0 0) (list 1 0 0) (list 0 1.5 0))
+                            (list (list 0 1 2)) (context-ref))"#,
+    )
+    .await;
+    assert_ne!(mesh.is_error, Some(true), "{mesh:?}");
+    assert_eq!(
+        structured(&mesh)["result"],
+        json!({"name": "Tri", "vertices": [[0.0, 0.0, 0.0], [1.0, 0.0, 0.0], [0.0, 1.5, 0.0]],
+               "faces": [[0, 1, 2]], "collection": "context"})
+    );
+
+    for malformed in [
+        r#"(mesh-from-data! "Bad" (list (list 0 0)) (list))"#,
+        r#"(mesh-from-data! "Bad" (list (list 0 0 0)) (list (list -1 0 0)))"#,
+    ] {
+        let rejected = evaluate(&server, malformed).await;
+        assert_eq!(rejected.is_error, Some(true), "{malformed} should fail");
+    }
+
+    let tagged = evaluate(
+        &server,
+        r#"(prop-set! (context-ref) "role" (hash "kind" "walkable_ground"))"#,
+    )
+    .await;
+    assert_eq!(
+        structured(&tagged)["result"],
+        json!({"key": "role", "value": {"kind": "walkable_ground"}})
+    );
+
     server.shutdown().await;
 }
 

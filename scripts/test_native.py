@@ -451,6 +451,62 @@ class NativeRnaTests(unittest.TestCase):
             del bpy.types.Scene.mcp_test_items
             bpy.utils.unregister_class(NativeTestItem)
 
+    def test_mesh_from_data_builds_a_linked_object(self):
+        before = set(bpy.data.meshes)
+        prism = self.execute(
+            "mesh_from_data",
+            name="MCP prism",
+            vertices=[[0, 0, 0], [1, 0, 0], [0, 1, 0], [0, 0, 1]],
+            faces=[[0, 2, 1], [0, 1, 3], [1, 2, 3], [0, 3, 2]],
+        )
+        actual = bpy.data.objects[self.get(prism, "name")]
+        try:
+            self.assertEqual(len(actual.data.vertices), 4)
+            self.assertEqual(len(actual.data.polygons), 4)
+            self.assertIn(actual.name, bpy.context.scene.collection.objects)
+        finally:
+            mesh = actual.data
+            bpy.data.objects.remove(actual)
+            bpy.data.meshes.remove(mesh)
+
+        collection = bpy.data.collections.new("MCP build target")
+        bpy.context.scene.collection.children.link(collection)
+        try:
+            target = self.call(self.get(self.data, "collections"), "get", collection.name)
+            placed = self.execute(
+                "mesh_from_data",
+                name="MCP placed",
+                vertices=[[0, 0, 0], [1, 0, 0], [0, 1, 0]],
+                faces=[[0, 1, 2]],
+                collection=target["$rna_ref"],
+            )
+            self.assertIn(self.get(placed, "name"), collection.objects)
+            self.assertNotIn(self.get(placed, "name"), bpy.context.scene.collection.objects)
+            for obj in list(collection.objects):
+                mesh = obj.data
+                bpy.data.objects.remove(obj)
+                bpy.data.meshes.remove(mesh)
+        finally:
+            bpy.data.collections.remove(collection)
+
+        # Rejected before Blender reads the indices, and no datablock is left behind.
+        for faces in ([[0, 1, 9]], [[0, 1]]):
+            self.assert_code(
+                "invalid_arguments",
+                "mesh_from_data",
+                name="MCP bad",
+                vertices=[[0, 0, 0], [1, 0, 0], [0, 1, 0]],
+                faces=faces,
+            )
+        self.assert_code(
+            "invalid_arguments",
+            "mesh_from_data",
+            name="MCP bad",
+            vertices=[[0, 0, 0]],
+            collection=self.get(self.data, "objects")["$rna_ref"],
+        )
+        self.assertEqual(set(bpy.data.meshes), before)
+
     def test_matrix_writes_take_the_rows_that_reads_return(self):
         # Blender assigns a nested list to a matrix column by column, so writing back
         # what rna_get returned used to transpose it: the translation landed in the
@@ -511,6 +567,42 @@ class NativeRnaTests(unittest.TestCase):
         finally:
             bpy.data.materials.remove(material)
             bpy.data.meshes.remove(mesh)
+
+    def test_custom_properties_round_trip_and_guard_rna(self):
+        actual = bpy.data.objects.new("MCP custom props", None)
+        try:
+            obj = self.call(self.get(self.data, "objects"), "get", actual.name)
+            ref = obj["$rna_ref"]
+            self.execute("id_property_set", reference=ref, key="role", value="walkable_ground")
+            self.execute("id_property_set", reference=ref, key="spawn", value={"weight": 2, "tags": ["a", "b"]})
+            self.assertEqual(actual["role"], "walkable_ground")
+            self.assertEqual(self.execute("id_property_get", reference=ref, key="role"), "walkable_ground")
+            self.assertEqual(
+                self.execute("id_property_get", reference=ref, key="spawn"),
+                {"weight": 2, "tags": ["a", "b"]},
+            )
+            self.assertEqual(self.execute("id_property_keys", reference=ref), ["role", "spawn"])
+            self.assertIsNone(self.execute("id_property_get", reference=ref, key="missing"))
+            self.assertEqual(self.execute("id_property_delete", reference=ref, key="spawn"), {"deleted": True})
+            self.assertEqual(self.execute("id_property_delete", reference=ref, key="spawn"), {"deleted": False})
+            self.assertNotIn("spawn", actual.keys())
+
+            # Registered RNA properties share this storage; they must go through rna_set.
+            bpy.types.Object.mcp_registered = bpy.props.IntProperty()
+            try:
+                self.assert_code("access_denied", "id_property_set", reference=ref, key="mcp_registered", value=3)
+            finally:
+                del bpy.types.Object.mcp_registered
+            for key in ("", "_RNA_UI", "x" * 64):
+                self.assert_code("invalid_arguments", "id_property_set", reference=ref, key=key, value=1)
+            self.assert_code("invalid_arguments", "id_property_set", reference=ref, key="role", value=None)
+
+            # A batch can tag many objects in one bridge request.
+            self.operations.validate_batch([
+                {"operation": "id_property_set", "reference": ref, "key": "role", "value": "prop"},
+            ])
+        finally:
+            bpy.data.objects.remove(actual)
 
     def test_animation_without_editor_context(self):
         objects = self.get(self.data, "objects")

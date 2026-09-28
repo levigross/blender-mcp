@@ -129,6 +129,7 @@ pub(super) fn register_all(
     register_catalog_functions(engine, bridge, runtime, deadline, state);
     register_operator_functions(engine, bridge, runtime, deadline, state);
     register_rna_functions(engine, bridge, runtime, deadline, state);
+    register_custom_property_functions(engine, bridge, runtime, deadline, state);
     register_runtime_functions(engine, bridge, runtime, deadline, state);
     register_workflow_functions(engine, bridge, runtime, deadline, state);
     crate::scheme::math::register_math_functions(engine);
@@ -250,6 +251,58 @@ fn register_operator_functions(
             context_override,
         })
     });
+}
+
+fn register_custom_property_functions(
+    engine: &mut Engine,
+    bridge: &Arc<dyn BlenderBridge>,
+    runtime: &tokio::runtime::Handle,
+    deadline: &EvalDeadline,
+    state: &Arc<BindingState>,
+) {
+    let invoke = Invocation::new(bridge, runtime, deadline, state);
+    engine.register_fn(
+        "prop-keys",
+        move |reference: SteelVal| -> Result<SteelVal, SteelErr> {
+            invoke.call(BridgeOperation::IdPropertyKeys {
+                reference: parse_reference(&reference)?,
+            })
+        },
+    );
+
+    let invoke = Invocation::new(bridge, runtime, deadline, state);
+    engine.register_fn(
+        "prop-get",
+        move |reference: SteelVal, key: String| -> Result<SteelVal, SteelErr> {
+            invoke.call(BridgeOperation::IdPropertyGet {
+                reference: parse_reference(&reference)?,
+                key,
+            })
+        },
+    );
+
+    let invoke = Invocation::new(bridge, runtime, deadline, state);
+    engine.register_fn(
+        "prop-set!",
+        move |reference: SteelVal, key: String, value: SteelVal| -> Result<SteelVal, SteelErr> {
+            invoke.call(BridgeOperation::IdPropertySet {
+                reference: parse_reference(&reference)?,
+                key,
+                value: steel_to_json(&value)?,
+            })
+        },
+    );
+
+    let invoke = Invocation::new(bridge, runtime, deadline, state);
+    engine.register_fn(
+        "prop-delete!",
+        move |reference: SteelVal, key: String| -> Result<SteelVal, SteelErr> {
+            invoke.call(BridgeOperation::IdPropertyDelete {
+                reference: parse_reference(&reference)?,
+                key,
+            })
+        },
+    );
 }
 
 fn register_rna_functions(
@@ -612,12 +665,16 @@ fn register_batch_workflow(engine: &mut Engine, invocation: &Invocation) {
                         | BridgeOperation::RnaCall { .. }
                         | BridgeOperation::RnaDescribe { .. }
                         | BridgeOperation::RnaItems { .. }
+                        | BridgeOperation::IdPropertyKeys { .. }
+                        | BridgeOperation::IdPropertyGet { .. }
+                        | BridgeOperation::IdPropertySet { .. }
+                        | BridgeOperation::IdPropertyDelete { .. }
                         | BridgeOperation::OperatorCall { .. }
                         | BridgeOperation::ContextRef
                         | BridgeOperation::DataRef
                 ) {
                     return Err(steel_error(
-                        "batch! only accepts RNA, operator, and root-reference commands",
+                        "batch! only accepts RNA, custom-property, operator, and root-reference commands",
                     ));
                 }
                 Ok(operation)
@@ -661,6 +718,34 @@ fn register_scene_workflow(engine: &mut Engine, invocation: &Invocation) {
     engine.register_fn("checkpoint!", move |filepath: String| {
         invoke.call(BridgeOperation::Checkpoint { filepath })
     });
+    let invoke = invocation.clone();
+    register_optional(
+        engine,
+        "mesh-from-data!",
+        3,
+        vec![Value::Null],
+        move |arguments| {
+            let name = String::from_steelval(&arguments[0])?;
+            let vertices = serde_json::from_value(steel_to_json(&arguments[1])?).map_err(|_| {
+                steel_error("mesh-from-data! vertices must be a list of (x y z) number lists")
+            })?;
+            let faces = serde_json::from_value(steel_to_json(&arguments[2])?).map_err(|_| {
+                steel_error("mesh-from-data! faces must be a list of vertex-index lists")
+            })?;
+            let collection = if steel_to_json(&arguments[3])?.is_null() {
+                None
+            } else {
+                Some(parse_reference(&arguments[3])?)
+            };
+            invoke.call(BridgeOperation::MeshFromData {
+                name,
+                vertices,
+                edges: Vec::new(),
+                faces,
+                collection,
+            })
+        },
+    );
     let invoke = invocation.clone();
     engine.register_fn("artifact-info", move |artifact_id: String| {
         let value = invoke.call_json(BridgeOperation::Artifact {

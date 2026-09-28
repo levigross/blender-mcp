@@ -61,6 +61,8 @@ fn scheme_blender_mcp_native(module: &Bound<'_, PyModule>) -> PyResult<()> {
             "batch",
             "scene_snapshot",
             "checkpoint",
+            "mesh_from_data",
+            "id_properties",
             "thumbnail",
             "artifact_release",
         ),

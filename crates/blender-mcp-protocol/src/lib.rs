@@ -103,6 +103,24 @@ pub enum BridgeOperation {
         reference: RnaReference,
         function: String,
     },
+    /// Custom (ID) properties are item access -- `obj["role"]` -- which the
+    /// attribute-only RNA operations cannot express.
+    IdPropertyKeys {
+        reference: RnaReference,
+    },
+    IdPropertyGet {
+        reference: RnaReference,
+        key: String,
+    },
+    IdPropertySet {
+        reference: RnaReference,
+        key: String,
+        value: Value,
+    },
+    IdPropertyDelete {
+        reference: RnaReference,
+        key: String,
+    },
     ReferenceRelease {
         references: Vec<RnaReference>,
     },
@@ -135,6 +153,18 @@ pub enum BridgeOperation {
     },
     Checkpoint {
         filepath: String,
+    },
+    /// Build a mesh object from vertex positions and index lists. `Mesh.from_pydata`
+    /// is Python-defined rather than RNA-published, so the RNA sandbox cannot reach it.
+    MeshFromData {
+        name: String,
+        vertices: Vec<[f64; 3]>,
+        #[serde(default)]
+        edges: Vec<[u32; 2]>,
+        #[serde(default)]
+        faces: Vec<Vec<u32>>,
+        #[serde(default)]
+        collection: Option<RnaReference>,
     },
     Render {
         #[serde(default)]
@@ -207,6 +237,9 @@ impl BridgeOperation {
             | Self::RenderStart { .. }
             | Self::Thumbnail { .. }
             | Self::Checkpoint { .. }
+            | Self::MeshFromData { .. }
+            | Self::IdPropertySet { .. }
+            | Self::IdPropertyDelete { .. }
             | Self::Shutdown => true,
             Self::Batch { requests, .. } => requests.iter().any(Self::is_mutating),
             _ => false,

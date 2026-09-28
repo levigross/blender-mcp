@@ -213,6 +213,70 @@ def basic_scene(client):
     assert client.value('(rna-get ss-modtest "levels")') == 1
 
 
+def build_scene(client, root):
+    """The stdlib build helpers against real headless Blender, end to end."""
+    client.evaluate('''
+        (define build (make-collection! "Build"))
+        (define hex (make-prism "Hex" 6 1.0 0.5 build))
+        (define hex-bevel (bevel! hex 0.02 2))
+        (subdivide! hex 1)
+        (define block (add-cube))
+        (set-location! block 3 0 0.5)
+        (move-to-collection! block build)
+        (define pivot (add-empty "PLAIN_AXES" (list 1 1 0)))
+        (parent! block pivot)
+        (turntable! pivot 1 5)
+        (prop-set! hex "role" "walkable_ground")
+        (define rig (three-point-lights! (list 0 0 0) 5.0))
+        (define shot (add-camera (list 0 -10 3)))
+        (set-camera! shot)
+        (frame-camera! shot (list hex block))
+    ''')
+    polygons = client.value('(length (collection-list (rna-get (rna-get hex "data") "polygons")))')
+    assert polygons == 8, polygons
+    assert client.value('(map (lambda (c) (rna-get c "name")) (object-collections hex))') == ["Build"]
+    assert client.value('(map (lambda (c) (rna-get c "name")) (object-collections block))') == ["Build"]
+    assert client.value('(prop-get hex "role")') == "walkable_ground"
+    assert client.value('(prop-keys hex)') == ["role"]
+    assert client.value('(length rig)') == 3
+    assert client.value('(map (lambda (m) (rna-get m "name")) (collection-list (rna-get hex "modifiers")))') == [
+        "Bevel", "Subdivision"]
+
+    # parent! must not move the child; at frame 1 the pivot has not turned yet.
+    client.evaluate('(set-frame! 1)')
+    world = client.value('(begin (refresh!) (list-ref (rna-get block "matrix_world") 0))')
+    assert abs(world[3] - 3.0) < 1e-5, world
+    # Half way through a linear turn the pivot faces the other way.
+    client.evaluate('(set-frame! 3)')
+    z = client.value('(list-ref (object-rotation pivot) 2)')
+    assert abs(z - 180.0) < 1e-3, z
+
+    # The framed camera looks at the centre of what it framed -- at frame 1, before
+    # the turntable carried the block round.
+    client.evaluate('(set-frame! 1)')
+    client.evaluate('''(define framing-dot
+        (let* ([bounds (scene-bounds (list hex block))]
+               [centre (map (lambda (a b) (/ (+ a b) 2.0)) (car bounds) (list-ref bounds 1))]
+               [aim (normalize (map - centre (object-location shot)))])
+          (apply + (map * (facing shot) aim))))''')
+    # Bind first: Steel lifts the inner lambda into a hidden top-level define,
+    # which would otherwise add an extra value to the result.
+    dot = client.value("framing-dot")
+    assert dot > 0.999, dot
+
+    # Edit mode round trip, headless: inset turns each of 6 faces into 5.
+    client.evaluate('(define inset (add-cube)) (inset-faces! inset 0.1 0.05)')
+    faces = client.value('''
+        (length (collection-list (rna-get (rna-get inset "data") "polygons")))''')
+    assert faces == 30, faces
+    assert client.value('(rna-get inset "mode")') == "OBJECT"
+
+    frame = root / "build.png"
+    client.evaluate('(render-preset! "draft") (set-resolution! 16 16) (rna-set! (cycles-settings) "samples" 1)')
+    written = client.value(f"(render-file! {json.dumps(str(frame))})")
+    assert Path(written).exists(), written
+
+
 def render_artifacts(client, root):
     output = root / "preview.png"
     quiet = client.evaluate(f"(preview! {json.dumps(str(output))} 50)")
@@ -558,6 +622,8 @@ def main():
         check(render_job, server.client)
         check(references_and_checkpoint, server.client, server.root)
         check(output_budget, server.client)
+        # Last: it leaves draft render settings and extra objects in the shared scene.
+        check(build_scene, server.client, server.root)
         assert not failures, "\n".join(failures)
         print("PASS: packaged MCP, resources, tasks, persistence, discovery, batch, snapshots, immutable artifacts, jobs, and epochs")
     with Server(sys.argv[1], sessions=[{"name": "other", "backend": "headless"}]) as server:

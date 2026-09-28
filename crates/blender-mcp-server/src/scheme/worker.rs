@@ -935,6 +935,8 @@ mod tests {
                 (define (data-ref) '())
                 (define (render-to! path) '())
                 (define (render-file! path) path)
+                (define (mesh-from-data! name vertices faces . collection) name)
+                (define (batch! commands) commands)
                 "#
                 .to_owned(),
             )
@@ -1064,5 +1066,158 @@ mod tests {
                 .expect_err("invalid size");
             assert!(error.to_string().contains("positive integer"));
         }
+    }
+
+    /// The last value an expression produced, as JSON. (`values_to_json` unwraps a lone
+    /// value, so convert just the last one rather than indexing the whole result.)
+    fn last_json(engine: &mut Engine, source: &str) -> serde_json::Value {
+        let values = engine.run(source.to_owned()).expect("runs");
+        let last = values.last().expect("a value").clone();
+        marshal::values_to_json(&[last]).expect("serializable result")
+    }
+
+    /// Stubs that log every bridge-facing call as a list, newest last.
+    const RECORDING_STUBS: &str = r#"
+        (define calls '())
+        (define (record! entry) (set! calls (append calls (list entry))))
+        (define (rna-call reference function args kwargs)
+          (record! (list "call" reference function args)) '())
+        (define (rna-set! reference key value) (record! (list "set" reference key value)) value)
+        (define (op-call idname arguments) (record! (list "op" idname)) '())
+    "#;
+
+    #[test]
+    fn matrix_inverse_undoes_rotation_scale_and_translation() {
+        // parent! writes this as the parent inverse; an error here silently throws the
+        // child across the scene.
+        let mut engine = stdlib_engine();
+        let round_trip = number_list(
+            &mut engine,
+            "(define m (list (list 0.0 -2.0 0.0 5.0)
+                             (list 2.0 0.0 0.0 -1.0)
+                             (list 0.0 0.0 3.0 2.0)
+                             (list 0.0 0.0 0.0 1.0)))
+             (matrix-apply (matrix-invert-affine m) (matrix-apply m (list 1.5 -2.0 4.0)))",
+        );
+        for (got, want) in round_trip.iter().zip([1.5, -2.0, 4.0]) {
+            assert!((got - want).abs() < 1e-12, "{round_trip:?}");
+        }
+        let singular = engine
+            .run("(matrix-invert-affine (list (list 0 0 0 0) (list 0 1 0 0) (list 0 0 1 0) (list 0 0 0 1)))".to_owned())
+            .expect_err("zero scale has no inverse");
+        assert!(singular.to_string().contains("singular"));
+    }
+
+    #[test]
+    fn prism_data_is_closed_and_outward_facing() {
+        let mut engine = stdlib_engine();
+        let data = last_json(&mut engine, "(prism-data 6 1.0 2.0)");
+        let vertices = data[0].as_array().expect("vertices");
+        let faces = data[1].as_array().expect("faces");
+        assert_eq!((vertices.len(), faces.len()), (12, 8));
+        let point = |index: &serde_json::Value| -> [f64; 3] {
+            let vertex = &vertices[usize::try_from(index.as_u64().expect("index")).expect("small")];
+            [0, 1, 2].map(|axis| vertex[axis].as_f64().expect("coordinate"))
+        };
+        // Newell's method: the normal of every face must point away from the centre
+        // (0, 0, 1), or Blender renders the solid inside out.
+        for face in faces {
+            let corners: Vec<[f64; 3]> = face.as_array().expect("face").iter().map(point).collect();
+            let mut normal = [0.0; 3];
+            for (index, a) in corners.iter().enumerate() {
+                let b = corners[(index + 1) % corners.len()];
+                normal[0] += (a[1] - b[1]) * (a[2] + b[2]);
+                normal[1] += (a[2] - b[2]) * (a[0] + b[0]);
+                normal[2] += (a[0] - b[0]) * (a[1] + b[1]);
+            }
+            let count = f64::from(u32::try_from(corners.len()).expect("small face"));
+            let centroid =
+                [0, 1, 2].map(|axis| corners.iter().map(|c| c[axis]).sum::<f64>() / count);
+            let outward =
+                normal[0] * centroid[0] + normal[1] * centroid[1] + normal[2] * (centroid[2] - 1.0);
+            assert!(outward > 0.0, "face {face} faces inward");
+        }
+    }
+
+    #[test]
+    fn heightfield_data_samples_the_height_function_on_a_centred_grid() {
+        let mut engine = stdlib_engine();
+        let data = last_json(
+            &mut engine,
+            "(heightfield-data 2 3 4 (lambda (x y) (+ x y)))",
+        );
+        let vertices = data[0].as_array().expect("vertices");
+        assert_eq!(vertices.len(), 12);
+        assert_eq!(data[1].as_array().expect("faces").len(), 6);
+        assert_eq!(vertices[0], serde_json::json!([-2.0, -2.0, -4.0]));
+        assert_eq!(vertices[11], serde_json::json!([2.0, 2.0, 4.0]));
+    }
+
+    #[test]
+    fn three_point_rig_stands_at_the_requested_distance() {
+        let mut engine = stdlib_engine();
+        let distances = number_list(
+            &mut engine,
+            "(map (lambda (entry)
+                    (let ([p (rig-position (list 1.0 2.0 3.0) 5.0 (list-ref entry 1) (list-ref entry 2))])
+                      (sqrt (apply + (map (lambda (a b) (* (- a b) (- a b))) p (list 1.0 2.0 3.0))))))
+                  three-point-rig)",
+        );
+        assert_eq!(distances.len(), 3);
+        for distance in distances {
+            assert!((distance - 5.0).abs() < 1e-9, "{distance}");
+        }
+    }
+
+    #[test]
+    fn select_only_clears_the_old_selection_before_activating() {
+        let mut engine = stdlib_engine_with_setup(&format!(
+            r#"{RECORDING_STUBS}
+            (define (rna-get object key)
+              (if (equal? key "selected_objects") (list "a" "b") "handle"))"#
+        ));
+        let calls = last_json(&mut engine, r#"(select-only! "c") calls"#);
+        assert_eq!(
+            calls,
+            serde_json::json!([
+                ["call", "a", "select_set", [false]],
+                ["call", "b", "select_set", [false]],
+                ["call", "c", "select_set", [true]],
+                ["set", "handle", "active", "c"],
+            ])
+        );
+    }
+
+    #[test]
+    fn move_to_collection_unlinks_every_owner_then_links() {
+        let mut engine = stdlib_engine_with_setup(&format!(
+            r#"{RECORDING_STUBS}
+            (define (rna-get object key)
+              (if (equal? key "users_collection") (list "one" "two") (string-append object "." key)))"#
+        ));
+        let calls = last_json(&mut engine, r#"(move-to-collection! "cube" "props") calls"#);
+        assert_eq!(
+            calls,
+            serde_json::json!([
+                ["call", "one.objects", "unlink", ["cube"]],
+                ["call", "two.objects", "unlink", ["cube"]],
+                ["call", "props.objects", "link", ["cube"]],
+            ])
+        );
+    }
+
+    #[test]
+    fn key_rotation_writes_radians_then_keys_that_frame() {
+        let mut engine = stdlib_engine_with_setup(RECORDING_STUBS);
+        let calls = last_json(&mut engine, r#"(key-rotation! "cube" 12 0 0 90) calls"#);
+        let calls = calls.as_array().expect("calls");
+        assert_eq!(calls.len(), 2, "{calls:?}");
+        assert_eq!(calls[0][2], "rotation_euler");
+        let z = calls[0][3][2].as_f64().expect("radians");
+        assert!((z - std::f64::consts::FRAC_PI_2).abs() < 1e-12);
+        assert_eq!(
+            calls[1],
+            serde_json::json!(["call", "cube", "keyframe_insert", ["rotation_euler"]])
+        );
     }
 }

@@ -167,6 +167,19 @@ impl BlenderOperations {
         result
     }
 
+    fn status(&mut self, python: Python<'_>) -> PyResult<Value> {
+        let app = python.import("bpy")?.getattr("app")?;
+        let version = app.getattr("version_string")?.extract::<String>()?;
+        let background = app.getattr("background")?.extract::<bool>()?;
+        let catalog = self.ensure_catalog(python)?;
+        Ok(json!({
+            "blender_version": version,
+            "operator_count": catalog["operators"].as_array().map_or(0, Vec::len),
+            "catalog_revision": catalog["revision"],
+            "background": background,
+        }))
+    }
+
     fn dispatch_inner(&mut self, python: Python<'_>, request: &Value) -> PyResult<Value> {
         if self.closed {
             return Err(operation_error(
@@ -203,25 +216,10 @@ impl BlenderOperations {
             }
             "rna_get" | "rna_set" | "rna_call" | "rna_describe" | "rna_items"
             | "rna_property_info" | "rna_function_info" => self.rna(python, operation, request),
-            "status" => {
-                let version = python
-                    .import("bpy")?
-                    .getattr("app")?
-                    .getattr("version_string")?
-                    .extract::<String>()?;
-                let background = python
-                    .import("bpy")?
-                    .getattr("app")?
-                    .getattr("background")?
-                    .extract::<bool>()?;
-                let catalog = self.ensure_catalog(python)?;
-                Ok(json!({
-                    "blender_version": version,
-                    "operator_count": catalog["operators"].as_array().map_or(0, Vec::len),
-                    "catalog_revision": catalog["revision"],
-                    "background": background,
-                }))
+            "id_property_keys" | "id_property_get" | "id_property_set" | "id_property_delete" => {
+                self.id_property(python, operation, request)
             }
+            "status" => self.status(python),
             "reference_stats" => Ok(self.references.stats()),
             "reference_release" => self
                 .references
@@ -248,6 +246,7 @@ impl BlenderOperations {
             }
             "batch" => self.batch(python, request),
             "checkpoint" => self.checkpoint(python, request),
+            "mesh_from_data" => self.mesh_from_data(python, request),
             "render" => self.render(python, request),
             "thumbnail" => self.thumbnail(python, request),
             "artifact" => self.artifacts.fetch(
@@ -583,6 +582,85 @@ impl BlenderOperations {
         }
     }
 
+    /// Custom properties: `struct[key]` rather than `struct.key`. Only structs that can
+    /// hold ID properties qualify, keys follow Blender's own naming limits, and writes
+    /// may not shadow a registered RNA property -- add-on settings live in the same
+    /// storage, and those must go through `rna_set` so their types are enforced.
+    fn id_property(
+        &mut self,
+        python: Python<'_>,
+        operation: &str,
+        request: &Value,
+    ) -> PyResult<Value> {
+        let reference = request.get("reference").cloned().unwrap_or(Value::Null);
+        let target = self.references.resolve(python, &reference)?;
+        let keys = target.call_method0("keys").map_err(|_| {
+            operation_error(
+                python,
+                "invalid_arguments",
+                "this Blender type cannot hold custom properties",
+            )
+        })?;
+        if operation == "id_property_keys" {
+            let mut names = keys
+                .try_iter()?
+                .map(|key| key?.extract::<String>())
+                .collect::<PyResult<Vec<_>>>()?;
+            names.retain(|name| !name.starts_with('_'));
+            names.sort_unstable();
+            return Ok(json!(names));
+        }
+        let key = custom_property_key(python, string_field(request, "key"))?;
+        let current = target.call_method1("get", (key,))?;
+        match operation {
+            "id_property_get" => {
+                if current.is_none() {
+                    return Ok(Value::Null);
+                }
+                // Groups and arrays are views into Blender memory; copy them out.
+                let value = if current.hasattr("to_dict")? {
+                    current.call_method0("to_dict")?
+                } else if current.hasattr("to_list")? {
+                    current.call_method0("to_list")?
+                } else {
+                    current
+                };
+                self.bounded(python, &value)
+            }
+            "id_property_set" => {
+                let value = request.get("value").unwrap_or(&Value::Null);
+                if value.is_null() {
+                    return Err(operation_error(
+                        python,
+                        "invalid_arguments",
+                        "custom properties cannot hold null; delete the property instead",
+                    ));
+                }
+                let registered = target
+                    .getattr("bl_rna")
+                    .and_then(|rna| rna.getattr("properties"))
+                    .and_then(|properties| properties.call_method1("get", (key,)))
+                    .is_ok_and(|property| !property.is_none());
+                if registered {
+                    return Err(operation_error(
+                        python,
+                        "access_denied",
+                        format!("'{key}' is a registered RNA property; set it with rna-set!"),
+                    ));
+                }
+                target.set_item(key, self.deserialize(python, value)?)?;
+                Ok(json!({ "updated": key }))
+            }
+            _ => {
+                let existed = !current.is_none();
+                if existed {
+                    target.del_item(key)?;
+                }
+                Ok(json!({ "deleted": existed }))
+            }
+        }
+    }
+
     fn rna_call(
         &mut self,
         python: Python<'_>,
@@ -812,6 +890,64 @@ impl BlenderOperations {
         Ok(
             json!({"path": filepath, "size": std::fs::metadata(&filepath)?.len(), "generation": self.generation(), "active_filepath": before, "copy": true}),
         )
+    }
+
+    /// `Mesh.from_pydata` is Python-defined, so the RNA sandbox cannot call it; this is
+    /// the one sanctioned route to it. Indices are checked here because Blender reads
+    /// out-of-range indices as garbage rather than raising.
+    fn mesh_from_data<'py>(&mut self, python: Python<'py>, request: &Value) -> PyResult<Value> {
+        let topology = MeshTopology::parse(request)
+            .map_err(|message| operation_error(python, "invalid_arguments", message))?;
+        let bpy = python.import("bpy")?;
+        let collection = match request.get("collection").filter(|value| !value.is_null()) {
+            Some(reference) => {
+                let target = self.references.resolve(python, reference)?;
+                if !is_blender_instance(&target, "Collection") {
+                    return Err(operation_error(
+                        python,
+                        "invalid_arguments",
+                        "collection must reference a Blender collection",
+                    ));
+                }
+                target
+            }
+            None => bpy
+                .getattr("context")?
+                .getattr("scene")?
+                .getattr("collection")?,
+        };
+        let data = bpy.getattr("data")?;
+        let mesh = data
+            .getattr("meshes")?
+            .call_method1("new", (&topology.name,))?;
+        let built = (|| -> PyResult<Bound<'py, PyAny>> {
+            mesh.call_method1(
+                "from_pydata",
+                (&topology.vertices, &topology.edges, &topology.faces),
+            )?;
+            mesh.call_method0("validate")?;
+            mesh.call_method0("update")?;
+            let object = data
+                .getattr("objects")?
+                .call_method1("new", (&topology.name, &mesh))?;
+            if let Err(error) = collection
+                .getattr("objects")?
+                .call_method1("link", (&object,))
+            {
+                data.getattr("objects")?
+                    .call_method1("remove", (&object,))?;
+                return Err(error);
+            }
+            Ok(object)
+        })();
+        match built {
+            Ok(object) => self.references.insert(&object),
+            Err(error) => {
+                // Leave no orphan datablock behind a failed build.
+                data.getattr("meshes")?.call_method1("remove", (&mesh,))?;
+                Err(error)
+            }
+        }
     }
 
     fn thumbnail(&mut self, python: Python<'_>, request: &Value) -> PyResult<Value> {
@@ -1150,6 +1286,101 @@ fn is_matrix_property(target: &Bound<'_, PyAny>, attribute: &str) -> bool {
         .is_ok_and(|subtype| subtype == "MATRIX")
 }
 
+/// Blender caps property names at 63 bytes, and `_`-prefixed names are its internal
+/// convention (`_RNA_UI` and friends), hidden here like private RNA names are.
+fn custom_property_key<'a>(python: Python<'_>, key: &'a str) -> PyResult<&'a str> {
+    if key.is_empty() || key.len() > 63 || key.starts_with('_') {
+        return Err(operation_error(
+            python,
+            "invalid_arguments",
+            "custom property keys must be 1-63 bytes and must not start with '_'",
+        ));
+    }
+    Ok(key)
+}
+
+/// Validated `mesh_from_data` input, shaped for `Mesh.from_pydata`.
+#[derive(Debug, PartialEq)]
+struct MeshTopology {
+    name: String,
+    vertices: Vec<(f64, f64, f64)>,
+    edges: Vec<(u32, u32)>,
+    faces: Vec<Vec<u32>>,
+}
+
+impl MeshTopology {
+    fn parse(request: &Value) -> Result<Self, String> {
+        let name = string_field(request, "name");
+        if name.is_empty() {
+            return Err("mesh name is required".to_owned());
+        }
+        let list = |key: &str| -> Result<&[Value], String> {
+            match request.get(key) {
+                None | Some(Value::Null) => Ok(&[]),
+                Some(Value::Array(items)) => Ok(items),
+                Some(_) => Err(format!("{key} must be an array")),
+            }
+        };
+        let vertices = list("vertices")?
+            .iter()
+            .map(|vertex| match vertex.as_array().map(Vec::as_slice) {
+                Some([x, y, z]) => match (x.as_f64(), y.as_f64(), z.as_f64()) {
+                    (Some(x), Some(y), Some(z))
+                        if x.is_finite() && y.is_finite() && z.is_finite() =>
+                    {
+                        Ok((x, y, z))
+                    }
+                    _ => Err("vertex coordinates must be finite numbers".to_owned()),
+                },
+                _ => Err("each vertex must be a list of three numbers".to_owned()),
+            })
+            .collect::<Result<Vec<_>, _>>()?;
+        if vertices.is_empty() {
+            return Err("a mesh needs at least one vertex".to_owned());
+        }
+        let count = vertices.len();
+        let indices = |item: &Value, what: &str| -> Result<Vec<u32>, String> {
+            item.as_array()
+                .ok_or_else(|| format!("each {what} must be a list of vertex indices"))?
+                .iter()
+                .map(|index| {
+                    index
+                        .as_u64()
+                        .and_then(|index| usize::try_from(index).ok())
+                        .filter(|&index| index < count)
+                        .and_then(|index| u32::try_from(index).ok())
+                        .ok_or_else(|| {
+                            format!("{what} index {index} is not a vertex index below {count}")
+                        })
+                })
+                .collect()
+        };
+        let edges = list("edges")?
+            .iter()
+            .map(|edge| match indices(edge, "edge")?.as_slice() {
+                [a, b] => Ok((*a, *b)),
+                _ => Err("each edge must join exactly two vertices".to_owned()),
+            })
+            .collect::<Result<Vec<_>, _>>()?;
+        let faces = list("faces")?
+            .iter()
+            .map(|face| {
+                let face = indices(face, "face")?;
+                if face.len() < 3 {
+                    return Err("each face needs at least three vertices".to_owned());
+                }
+                Ok(face)
+            })
+            .collect::<Result<Vec<_>, _>>()?;
+        Ok(Self {
+            name: name.to_owned(),
+            vertices,
+            edges,
+            faces,
+        })
+    }
+}
+
 fn collection_revision(
     python: Python<'_>,
     target: &Bound<'_, PyAny>,
@@ -1222,6 +1453,10 @@ fn validate_batch_requests(python: Python<'_>, requests: &Value) -> PyResult<()>
                 | "rna_items"
                 | "rna_property_info"
                 | "rna_function_info"
+                | "id_property_keys"
+                | "id_property_get"
+                | "id_property_set"
+                | "id_property_delete"
                 | "operator_call"
                 | "operator_poll"
                 | "operator_info"
@@ -1252,7 +1487,7 @@ fn validate_batch_requests(python: Python<'_>, requests: &Value) -> PyResult<()>
             ));
         }
         let operation = string_field(request, "operation");
-        if operation.starts_with("rna_")
+        if (operation.starts_with("rna_") || operation.starts_with("id_property_"))
             && !request.get("reference").is_some_and(|reference| {
                 reference.get("generation").is_some_and(Value::is_u64)
                     && reference.get("id").is_some_and(Value::is_string)
@@ -1269,10 +1504,12 @@ fn validate_batch_requests(python: Python<'_>, requests: &Value) -> PyResult<()>
             "rna_get" | "rna_set" | "rna_property_info" => Some("attribute"),
             "rna_call" | "rna_function_info" => Some("function"),
             "operator_call" | "operator_poll" | "operator_info" => Some("idname"),
+            "id_property_get" | "id_property_set" | "id_property_delete" => Some("key"),
             _ => None,
         };
         if field.is_some_and(|field| !request.get(field).is_some_and(Value::is_string))
-            || (operation == "rna_set" && request.get("value").is_none())
+            || (matches!(operation, "rna_set" | "id_property_set")
+                && request.get("value").is_none())
             || request.get("args").is_some_and(|value| !value.is_array())
             || request
                 .get("kwargs")
@@ -1347,5 +1584,37 @@ mod tests {
                 "unlink",
             ]
         );
+    }
+
+    #[test]
+    fn mesh_topology_accepts_a_quad_and_rejects_bad_indices() {
+        let quad = json!({
+            "name": "Quad",
+            "vertices": [[0, 0, 0], [1, 0, 0], [1, 1, 0], [0, 1, 0.5]],
+            "faces": [[0, 1, 2, 3]],
+        });
+        let parsed = MeshTopology::parse(&quad).expect("valid quad");
+        assert_eq!(parsed.vertices[3], (0.0, 1.0, 0.5));
+        assert_eq!(parsed.faces, vec![vec![0, 1, 2, 3]]);
+        assert!(parsed.edges.is_empty());
+
+        // Blender reads an out-of-range index as garbage instead of raising, so each of
+        // these must be refused before `from_pydata` ever sees it.
+        for (field, value) in [
+            ("faces", json!([[0, 1, 4]])),
+            ("faces", json!([[0, 1]])),
+            ("faces", json!([[0, -1, 2]])),
+            ("edges", json!([[0, 1, 2]])),
+            ("vertices", json!([[0, 0]])),
+            ("vertices", json!([])),
+            ("name", json!("")),
+        ] {
+            let mut request = quad.clone();
+            request[field] = value.clone();
+            assert!(
+                MeshTopology::parse(&request).is_err(),
+                "{field} = {value} should be rejected"
+            );
+        }
     }
 }
