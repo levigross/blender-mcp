@@ -12,7 +12,12 @@ use blender_mcp_protocol::{BlenderReport, BridgeOperation, OperatorCatalog};
 use blender_mcp_transport::BlenderBridge;
 use serde::Serialize;
 use serde_json::Value;
-use steel::{rerrs::SteelErr, rvals::SteelVal, steel_vm::engine::Engine};
+use steel::{
+    parser::{ast::ExprKind, parser::Parser},
+    rerrs::SteelErr,
+    rvals::SteelVal,
+    steel_vm::engine::Engine,
+};
 use thiserror::Error;
 use tokio::sync::{OwnedSemaphorePermit, Semaphore, mpsc, oneshot};
 use tokio_util::sync::CancellationToken;
@@ -433,6 +438,7 @@ fn process_request(
         *active_deadline = Some(Arc::clone(&request.context));
     }
 
+    let user_forms = user_form_count(&request.code);
     let run = run_with_watchdog(
         engine,
         request.code,
@@ -465,6 +471,7 @@ fn process_request(
         }
     };
 
+    let evaluation = evaluation.map(|values| user_values(values, user_forms));
     let response = evaluation_response(
         engine,
         evaluation,
@@ -702,6 +709,32 @@ enum WatchdogReason {
     Completed,
     Timeout,
     Cancelled,
+}
+
+/// How many values the user's program should produce: one per top-level form, except
+/// macro and module forms, which produce none. `None` when the source does not parse.
+fn user_form_count(code: &str) -> Option<usize> {
+    let forms = Parser::parse(code).ok()?;
+    Some(
+        forms
+            .iter()
+            .filter(|form| !matches!(form, ExprKind::Macro(_) | ExprKind::Require(_)))
+            .count(),
+    )
+}
+
+/// Steel's lambda lifting hoists inner lambdas into synthetic top-level defines and
+/// prepends them to the program (`lift_all_local_functions`,
+/// `lift_pure_local_functions`), so `engine.run` returns an extra `#<void>` for each,
+/// ahead of the user's values. Keep the last value per user form so one expression
+/// returns one value, as documented.
+fn user_values(mut values: Vec<SteelVal>, forms: Option<usize>) -> Vec<SteelVal> {
+    if let Some(forms) = forms
+        && values.len() > forms
+    {
+        values.drain(..values.len() - forms);
+    }
+    values
 }
 
 fn run_with_watchdog(
@@ -1066,6 +1099,43 @@ mod tests {
                 .expect_err("invalid size");
             assert!(error.to_string().contains("positive integer"));
         }
+    }
+
+    /// What a user sees for `source`: the real engine, then the lifted-define trim.
+    fn user_result(engine: &mut Engine, source: &str) -> serde_json::Value {
+        let values = engine.run(source.to_owned()).expect("runs");
+        marshal::values_to_json(&user_values(values, user_form_count(source)))
+            .expect("serializable result")
+    }
+
+    #[test]
+    fn lifted_lambdas_do_not_add_values_to_the_result() {
+        // Regression: an inner lambda was hoisted into a hidden top-level define, so
+        // one expression returned [null, 6] instead of 6.
+        let mut engine = Engine::new_sandboxed();
+        let lifted = "(let* ([a (list 1 2)] [b (map (lambda (x) (* x 2)) a)]) (apply + b))";
+        assert_eq!(
+            engine.run(lifted.to_owned()).expect("runs").len(),
+            2,
+            "Steel still lifts"
+        );
+        assert_eq!(user_result(&mut engine, lifted), serde_json::json!(6));
+        // Several forms still give one value each, in order, with lifting among them.
+        assert_eq!(
+            user_result(
+                &mut engine,
+                "(define y 3) (let* ([b (map (lambda (x) (* x y)) (list 1 2))]) b) (+ 1 1)"
+            ),
+            serde_json::json!([null, [3, 6], 2])
+        );
+        // Macro definitions produce no value and are not counted.
+        assert_eq!(
+            user_result(
+                &mut engine,
+                "(define-syntax twice (syntax-rules () [(_ e) (begin e e)])) (twice (+ 1 2))"
+            ),
+            serde_json::json!(3)
+        );
     }
 
     /// The last value an expression produced, as JSON. (`values_to_json` unwraps a lone

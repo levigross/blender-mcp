@@ -254,14 +254,11 @@ def build_scene(client, root):
     # The framed camera looks at the centre of what it framed -- at frame 1, before
     # the turntable carried the block round.
     client.evaluate('(set-frame! 1)')
-    client.evaluate('''(define framing-dot
+    dot = client.value('''
         (let* ([bounds (scene-bounds (list hex block))]
                [centre (map (lambda (a b) (/ (+ a b) 2.0)) (car bounds) (list-ref bounds 1))]
                [aim (normalize (map - centre (object-location shot)))])
-          (apply + (map * (facing shot) aim))))''')
-    # Bind first: Steel lifts the inner lambda into a hidden top-level define,
-    # which would otherwise add an extra value to the result.
-    dot = client.value("framing-dot")
+          (apply + (map * (facing shot) aim)))''')
     assert dot > 0.999, dot
 
     # Edit mode round trip, headless: inset turns each of 6 faces into 5.
