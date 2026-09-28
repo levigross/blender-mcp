@@ -451,6 +451,47 @@ class NativeRnaTests(unittest.TestCase):
             del bpy.types.Scene.mcp_test_items
             bpy.utils.unregister_class(NativeTestItem)
 
+    def test_node_handles_survive_subdata_invalidation(self):
+        # Editing a node fires a shading depsgraph update, which marks sub-data dirty.
+        # Node-tree data is individually allocated, so its handles must survive that;
+        # mesh elements are array-backed and must still be retired.
+        material = bpy.data.materials.new("MCP durable nodes")
+        mesh = bpy.data.meshes.new("MCP volatile verts")
+        mesh.from_pydata([(0, 0, 0), (1, 0, 0), (0, 1, 0)], [], [(0, 1, 2)])
+        try:
+            material.use_nodes = True
+            handle = self.call(self.get(self.data, "materials"), "get", material.name)
+            tree = self.get(handle, "node_tree")
+            node = self.call(self.get(tree, "nodes"), "new", "ShaderNodeTexNoise")
+            scale = self.call(self.get(node, "inputs"), "get", "Scale")
+            link = self.call(
+                self.get(tree, "links"),
+                "new",
+                self.call(self.get(node, "outputs"), "get", "Fac"),
+                self.call(
+                    self.get(self.call(self.get(tree, "nodes"), "get", "Principled BSDF"), "inputs"),
+                    "get",
+                    "Roughness",
+                ),
+            )
+            mesh_handle = self.call(self.get(self.data, "meshes"), "get", mesh.name)
+            vertex = self.items(self.get(mesh_handle, "vertices"))[0]
+
+            self.operations.invalidate_subdata()
+
+            self.set_value(scale, "default_value", 7.5)
+            self.assertEqual(self.get(node, "bl_idname"), "ShaderNodeTexNoise")
+            self.assertEqual(self.get(self.get(link, "from_node"), "name"), self.get(node, "name"))
+            self.assertAlmostEqual(material.node_tree.nodes[self.get(node, "name")].inputs["Scale"].default_value, 7.5)
+            self.assert_code("stale_reference", "rna_get", reference=vertex["$rna_ref"], attribute="co")
+
+            # Removal through MCP still retires the node's handles.
+            self.call(self.get(tree, "nodes"), "remove", node)
+            self.assert_code("stale_reference", "rna_get", reference=node["$rna_ref"], attribute="name")
+        finally:
+            bpy.data.materials.remove(material)
+            bpy.data.meshes.remove(mesh)
+
     def test_animation_without_editor_context(self):
         objects = self.get(self.data, "objects")
         obj = self.call(objects, "new", "MCP animation test", None)

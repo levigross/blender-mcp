@@ -28,15 +28,18 @@ enum Locator {
         name: String,
         pointer: Option<u64>,
         uid: Option<u64>,
+        durable: bool,
     },
     Member {
         parent: Arc<Locator>,
         pointer: u64,
+        durable: bool,
     },
     Path {
         owner: Arc<Locator>,
         path: String,
         pointer: u64,
+        durable: bool,
     },
     // Ordinary Python objects own their memory; unlike RNA these are safe to retain.
     Python(Py<PyAny>),
@@ -183,6 +186,7 @@ impl ReferenceStore {
             name: name.to_owned(),
             pointer: pointer(value),
             uid,
+            durable: is_node_tree_data(value),
         });
         self.store(value, locator, Some(identity))
     }
@@ -202,7 +206,11 @@ impl ReferenceStore {
         let identity = format!("member:{}:{pointer}", reference["id"]);
         self.store(
             value,
-            Arc::new(Locator::Member { parent, pointer }),
+            Arc::new(Locator::Member {
+                parent,
+                pointer,
+                durable: is_node_tree_data(value),
+            }),
             Some(identity),
         )
     }
@@ -234,6 +242,7 @@ impl ReferenceStore {
                 owner,
                 path,
                 pointer,
+                ..
             } = &*locator
             {
                 format!("path:{:?}:{path}:{type_name}:{pointer}", owner.owner_uid())
@@ -407,6 +416,7 @@ fn infer_locator(value: &Bound<'_, PyAny>) -> PyResult<Arc<Locator>> {
                 owner,
                 path,
                 pointer,
+                durable: is_node_tree_data(value),
             }));
         }
         return Err(operation_error(
@@ -449,6 +459,29 @@ fn resolve_id<'py>(
         python,
         "stale_reference",
         "ID was removed or is outside the bounded owner search",
+    ))
+}
+
+/// Scan the live collection for the exact member; never dereference a cached pointer.
+fn resolve_member<'py>(
+    python: Python<'py>,
+    parent: &Locator,
+    expected: u64,
+    depth: usize,
+) -> PyResult<Bound<'py, PyAny>> {
+    for item in resolve_locator(python, parent, depth + 1)?
+        .try_iter()?
+        .take(MAX_RESOLVE_SCAN)
+    {
+        let item = item?;
+        if pointer(&item) == Some(expected) {
+            return Ok(item);
+        }
+    }
+    Err(operation_error(
+        python,
+        "stale_reference",
+        "RNA collection member was removed",
     ))
 }
 
@@ -501,6 +534,7 @@ fn resolve_locator<'py>(
             name,
             pointer: expected,
             uid,
+            ..
         } => {
             let value = resolve_locator(python, parent, depth + 1)?.getattr(name.as_str())?;
             let matches = if let Some(uid) = uid {
@@ -524,26 +558,13 @@ fn resolve_locator<'py>(
         Locator::Member {
             parent,
             pointer: expected,
-        } => {
-            for item in resolve_locator(python, parent, depth + 1)?
-                .try_iter()?
-                .take(MAX_RESOLVE_SCAN)
-            {
-                let item = item?;
-                if pointer(&item) == Some(*expected) {
-                    return Ok(item);
-                }
-            }
-            Err(operation_error(
-                python,
-                "stale_reference",
-                "RNA collection member was removed",
-            ))
-        }
+            ..
+        } => resolve_member(python, parent, *expected, depth),
         Locator::Path {
             owner,
             path,
             pointer: expected,
+            ..
         } => {
             let value =
                 resolve_locator(python, owner, depth + 1)?.call_method1("path_resolve", (path,))?;
@@ -568,16 +589,45 @@ fn type_name(value: &Bound<'_, PyAny>) -> String {
         .unwrap_or_else(|_| "object".to_owned())
 }
 
+/// Node-tree data -- nodes, sockets, links, interface items -- is allocated one item at a
+/// time and addressed by name, so geometry and shading updates never move it. Handles to
+/// it survive sub-data invalidation; resolution still re-finds each one from its live
+/// owner and checks its pointer and type. Array-backed data (mesh elements, layers) can
+/// be reallocated with a different element at the same address, so it stays volatile.
+fn is_node_tree_data(value: &Bound<'_, PyAny>) -> bool {
+    let Ok(types) = value
+        .py()
+        .import("bpy")
+        .and_then(|bpy| bpy.getattr("types"))
+    else {
+        return false;
+    };
+    ["Node", "NodeSocket", "NodeLink", "NodeTreeInterfaceItem"]
+        .iter()
+        .any(|name| {
+            types
+                .getattr(*name)
+                .and_then(|class| value.is_instance(&class))
+                .unwrap_or(false)
+        })
+}
+
 impl Locator {
+    /// Whether invalidating sub-data must retire this handle: it, or anything it is
+    /// resolved through, may be reallocated in place by Blender.
     fn has_physical_subdata(&self) -> bool {
         match self {
-            Self::Member { .. } | Self::Path { .. } => true,
+            Self::Member {
+                parent, durable, ..
+            } => !durable || parent.has_physical_subdata(),
+            Self::Path { owner, durable, .. } => !durable || owner.has_physical_subdata(),
             Self::Attribute {
                 parent,
                 pointer,
                 uid,
+                durable,
                 ..
-            } => (pointer.is_some() && uid.is_none()) || parent.has_physical_subdata(),
+            } => (!durable && pointer.is_some() && uid.is_none()) || parent.has_physical_subdata(),
             _ => false,
         }
     }

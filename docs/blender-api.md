@@ -100,6 +100,17 @@ node kind, or object data:
 ; => 0.25
 ```
 
+How long a handle below an ID lasts depends on how Blender stores the data:
+
+- **Node-tree data** — nodes, sockets, links, and group interface items — is allocated
+  one item at a time, so its handles survive operators, mode changes, and the
+  depsgraph updates that editing a node triggers. A node graph can be built across
+  several evaluations. Removing a node through MCP retires its handles.
+- **Array-backed data** — mesh vertices, edges, polygons, loops, and layers — can be
+  reallocated with a different element at the same address. Those handles are
+  retired after any operator, mode change, keyframe edit, or geometry update; fetch
+  them again, or better, use `foreach_get`/`foreach_set` on the collection.
+
 ## Operators
 
 An operator returns its *status*, never the thing it made:
