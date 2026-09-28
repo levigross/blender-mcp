@@ -451,6 +451,26 @@ class NativeRnaTests(unittest.TestCase):
             del bpy.types.Scene.mcp_test_items
             bpy.utils.unregister_class(NativeTestItem)
 
+    def test_matrix_writes_take_the_rows_that_reads_return(self):
+        # Blender assigns a nested list to a matrix column by column, so writing back
+        # what rna_get returned used to transpose it: the translation landed in the
+        # bottom row and the object was thrown across the scene.
+        actual = bpy.data.objects.new("MCP matrix", None)
+        bpy.context.scene.collection.objects.link(actual)
+        try:
+            obj = self.call(self.get(self.data, "objects"), "get", actual.name)
+            rows = [[0.0, -1.0, 0.0, 5.0], [1.0, 0.0, 0.0, -2.0], [0.0, 0.0, 1.0, 3.0], [0.0, 0.0, 0.0, 1.0]]
+            self.set_value(obj, "matrix_world", rows)
+            self.assertEqual(tuple(actual.location), (5.0, -2.0, 3.0))
+            self.assertEqual(self.get(obj, "matrix_world"), rows)
+            self.set_value(obj, "matrix_parent_inverse", rows)
+            self.assertEqual(self.get(obj, "matrix_parent_inverse"), rows)
+            # Plain arrays that are not matrices keep their ordinary meaning.
+            self.set_value(obj, "scale", [1.0, 2.0, 3.0])
+            self.assertEqual(tuple(actual.scale), (1.0, 2.0, 3.0))
+        finally:
+            bpy.data.objects.remove(actual)
+
     def test_node_handles_survive_subdata_invalidation(self):
         # Editing a node fires a shading depsgraph update, which marks sub-data dirty.
         # Node-tree data is individually allocated, so its handles must survive that;

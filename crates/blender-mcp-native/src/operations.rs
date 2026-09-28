@@ -513,8 +513,18 @@ impl BlenderOperations {
             "rna_set" => {
                 let attribute = string_field(request, "attribute");
                 let attribute = Self::public_name(python, attribute, "attribute")?;
-                let value =
-                    self.deserialize(python, request.get("value").unwrap_or(&Value::Null))?;
+                let raw = request.get("value").unwrap_or(&Value::Null);
+                let value = self.deserialize(python, raw)?;
+                let value = if is_row_matrix(raw) && is_matrix_property(&target, attribute) {
+                    // Reads return rows, but Blender assigns a nested list to a matrix
+                    // column by column. Build a Matrix so writes take rows too.
+                    python
+                        .import("mathutils")?
+                        .getattr("Matrix")?
+                        .call1((value,))?
+                } else {
+                    value
+                };
                 target.setattr(attribute, value)?;
                 Ok(json!({ "updated": attribute }))
             }
@@ -1114,6 +1124,30 @@ fn array_field<'a>(python: Python<'_>, request: &'a Value, key: &str) -> PyResul
                 format!("{key} must be an array"),
             )
         })
+}
+
+/// A list of equal-length numeric rows -- the shape `rna_get` returns for a matrix.
+fn is_row_matrix(value: &Value) -> bool {
+    let Some(rows) = value.as_array() else {
+        return false;
+    };
+    let width = rows.first().and_then(Value::as_array).map_or(0, Vec::len);
+    (2..=4).contains(&rows.len())
+        && (2..=4).contains(&width)
+        && rows.iter().all(|row| {
+            row.as_array()
+                .is_some_and(|row| row.len() == width && row.iter().all(Value::is_number))
+        })
+}
+
+fn is_matrix_property(target: &Bound<'_, PyAny>, attribute: &str) -> bool {
+    target
+        .getattr("bl_rna")
+        .and_then(|rna| rna.getattr("properties"))
+        .and_then(|properties| properties.call_method1("get", (attribute,)))
+        .and_then(|property| property.getattr("subtype"))
+        .and_then(|subtype| subtype.extract::<String>())
+        .is_ok_and(|subtype| subtype == "MATRIX")
 }
 
 fn collection_revision(
