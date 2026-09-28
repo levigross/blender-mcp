@@ -17,7 +17,7 @@ use blender_mcp_transport::{BlenderBridge, BridgeHealth, BridgeMode, TransportEr
 use rmcp::{
     ClientLifecycleMode, ClientServiceExt as _, ServiceExt as _,
     model::{
-        CallToolRequestParams, CallToolResponse, CallToolResult, CancelTaskParams,
+        CacheScope, CallToolRequestParams, CallToolResponse, CallToolResult, CancelTaskParams,
         ClientCapabilities, ClientInfo, DetailedTask, GetTaskParams, Implementation,
         ProtocolVersion, ReadResourceRequestParams, ResourceContents, TaskPayload, TaskStatus,
         UpdateTaskParams,
@@ -538,6 +538,35 @@ async fn resources_list_and_read_round_trip() {
         unknown.is_err(),
         "an unknown URI must surface as a protocol error"
     );
+
+    client.cancel().await.expect("client closes");
+    server.shutdown().await;
+}
+
+#[tokio::test]
+async fn resource_results_carry_cache_hints_required_by_2026_07_28() {
+    let server = TestServer::start().await;
+    let client = server.connect_tasks().await;
+
+    let list = client.list_resources(None).await.expect("resources/list");
+    assert_eq!(list.ttl_ms, Some(0));
+    assert_eq!(list.cache_scope, Some(CacheScope::Public));
+
+    let templates = client
+        .list_resource_templates(None)
+        .await
+        .expect("resources/templates/list");
+    assert_eq!(templates.ttl_ms, Some(0));
+    assert_eq!(templates.cache_scope, Some(CacheScope::Public));
+
+    let read = client
+        .read_resource(ReadResourceRequestParams::new(
+            "resources://blender/sessions",
+        ))
+        .await
+        .expect("resources/read");
+    assert_eq!(read.ttl_ms, Some(0));
+    assert_eq!(read.cache_scope, Some(CacheScope::Private));
 
     client.cancel().await.expect("client closes");
     server.shutdown().await;

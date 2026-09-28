@@ -242,9 +242,13 @@ impl ServerHandler for BlenderMcp {
     fn list_resource_templates(
         &self,
         _request: Option<PaginatedRequestParams>,
-        _context: RequestContext<RoleServer>,
+        context: RequestContext<RoleServer>,
     ) -> impl Future<Output = Result<ListResourceTemplatesResult, McpError>> {
-        ready(Ok(resources::templates()))
+        let mut result = resources::templates();
+        if supports_cache_hints(&context) {
+            result = result.with_ttl_ms(0).with_cache_scope(CacheScope::Public);
+        }
+        ready(Ok(result))
     }
 
     fn list_tools(
@@ -252,11 +256,8 @@ impl ServerHandler for BlenderMcp {
         _request: Option<PaginatedRequestParams>,
         context: RequestContext<RoleServer>,
     ) -> impl Future<Output = Result<ListToolsResult, McpError>> {
-        let supports_cache_hints = context
-            .protocol_version()
-            .is_some_and(|version| version >= ProtocolVersion::V_2026_07_28);
         let mut result = ListToolsResult::with_all_items(self.tool_router.list_all());
-        if supports_cache_hints {
+        if supports_cache_hints(&context) {
             result = result.with_ttl_ms(0).with_cache_scope(CacheScope::Public);
         }
         ready(Ok(result))
@@ -265,9 +266,13 @@ impl ServerHandler for BlenderMcp {
     fn list_resources(
         &self,
         _request: Option<PaginatedRequestParams>,
-        _context: RequestContext<RoleServer>,
+        context: RequestContext<RoleServer>,
     ) -> impl Future<Output = Result<ListResourcesResult, McpError>> {
-        ready(Ok(resources::list_sessions(&self.sessions)))
+        let mut result = resources::list_sessions(&self.sessions);
+        if supports_cache_hints(&context) {
+            result = result.with_ttl_ms(0).with_cache_scope(CacheScope::Public);
+        }
+        ready(Ok(result))
     }
 
     async fn read_resource(
@@ -275,10 +280,22 @@ impl ServerHandler for BlenderMcp {
         request: ReadResourceRequestParams,
         context: RequestContext<RoleServer>,
     ) -> Result<ReadResourceResponse, McpError> {
-        resources::read_sessions(&request.uri, &self.sessions, context.ct.clone())
-            .await
-            .map(ReadResourceResponse::Complete)
+        let mut result =
+            resources::read_sessions(&request.uri, &self.sessions, context.ct.clone()).await?;
+        if supports_cache_hints(&context) {
+            // Contents include live session state and rendered artifacts.
+            result = result.with_ttl_ms(0).with_cache_scope(CacheScope::Private);
+        }
+        Ok(ReadResourceResponse::Complete(result))
     }
+}
+
+/// Protocol 2026-07-28 (SEP-2549) requires `ttlMs` and `cacheScope` on list and read results;
+/// clients that negotiated it reject results missing them.
+fn supports_cache_hints(context: &RequestContext<RoleServer>) -> bool {
+    context
+        .protocol_version()
+        .is_some_and(|version| version >= ProtocolVersion::V_2026_07_28)
 }
 
 #[cfg(test)]
