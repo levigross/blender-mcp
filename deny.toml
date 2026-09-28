@@ -63,3 +63,5 @@ wildcards = "deny"
 unknown-registry = "deny"
 unknown-git = "deny"
 allow-registry = ["https://github.com/rust-lang/crates.io-index"]
+# steel-core 0.8.3 plus the constant-folding fix; see [patch.crates-io] in Cargo.toml.
+allow-git = ["https://github.com/levigross/steel"]

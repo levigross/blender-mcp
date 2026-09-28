@@ -1109,6 +1109,27 @@ mod tests {
     }
 
     #[test]
+    fn set_on_a_global_reaches_closures_from_earlier_evaluations() {
+        // Each scheme_eval is its own Steel compilation unit. Unpatched steel-core
+        // inlines a top-level atom define into closures compiled with it, so a later
+        // `set!` is invisible to them (mattwparas/steel#707, pinned in Cargo.toml).
+        let mut engine = Engine::new_sandboxed();
+        engine
+            .run("(define n 0) (define (get-n) n)".to_owned())
+            .expect("defines");
+        engine.run("(set! n 5)".to_owned()).expect("set!");
+        assert_eq!(user_result(&mut engine, "(get-n)"), serde_json::json!(5));
+        // Replacing a function with set! (not a second define) reaches its callers.
+        engine
+            .run("(define (f) 1) (define (g) (f))".to_owned())
+            .expect("defines");
+        engine
+            .run("(set! f (lambda () 2))".to_owned())
+            .expect("set!");
+        assert_eq!(user_result(&mut engine, "(g)"), serde_json::json!(2));
+    }
+
+    #[test]
     fn lifted_lambdas_do_not_add_values_to_the_result() {
         // Regression: an inner lambda was hoisted into a hidden top-level define, so
         // one expression returned [null, 6] instead of 6.

@@ -18,6 +18,18 @@ later calls:
 
 Pass `reset: true` to `scheme_eval` to get a clean environment back.
 
+**Change a global with `set!`, not a second `define`.** `set!` updates the binding in
+place, and every function that uses it sees the new value, including functions from
+earlier calls. A second `define` of the same name creates a *new* binding: code
+evaluated afterwards sees it, but functions defined before it keep the old one.
+
+```scheme
+(define speed 1) (define (step) (* speed 2))   ; one call
+(set! speed 5)                                  ; a later call
+(step)                                          ; => 10
+(set! step (lambda () 0))                       ; replaces step for its callers too
+```
+
 Every top-level expression contributes a value; several expressions return a list of
 them. `define` evaluates to `#<void>`, so a script of definitions returns a row of
 voids — harmless, but wrap the interesting value last if you want a clean result.

@@ -56,3 +56,11 @@ opt-level = 3
 # The Steel worker isolates VM panics with `catch_unwind` and rebuilds its engine,
 # so unwinding must stay enabled; `panic = "abort"` would take the server down instead.
 strip = "symbols"
+
+# Constant evaluation and function inlining copy top-level defines into code compiled
+# alongside them, so a `set!` in a later evaluation is invisible to that code. Fix
+# pending upstream as https://github.com/mattwparas/steel/pull/707; this rev is
+# steel-core 0.8.3 plus its two commits. Drop the patch (and the deny.toml
+# allow-git entry) once a release includes it.
+[patch.crates-io]
+steel-core = { git = "https://github.com/levigross/steel", rev = "76287970ed751282982f9749baba4dad6ec17166" }
