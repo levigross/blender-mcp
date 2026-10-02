@@ -109,7 +109,13 @@ pub(crate) fn property_descriptor(property: &Bound<'_, PyAny>) -> Value {
                 .unwrap_or(false),
         ),
     );
-    descriptor.insert("enum_items".to_owned(), enum_items(property));
+    let items = enum_items(property);
+    let dynamic_items = kind == "ENUM" && items.as_array().is_some_and(Vec::is_empty);
+    descriptor.insert("enum_items".to_owned(), items);
+    if dynamic_items {
+        // Options come from a context-dependent callback, so none are listed here.
+        descriptor.insert("enum_items_dynamic".to_owned(), Value::Bool(true));
+    }
     for (key, source) in [
         ("read_only", "is_readonly"),
         ("animatable", "is_animatable"),
@@ -132,7 +138,29 @@ pub(crate) fn property_descriptor(property: &Bound<'_, PyAny>) -> Value {
     {
         descriptor.insert("fixed_type".to_owned(), Value::String(fixed_type));
     }
-    if let Ok(default) = property.getattr("default") {
+    // Blender names an enum default by looking its value up among the options, and
+    // when the lookup fails it logs "current value ... matches no enum" and yields ''.
+    // A flag enum's default is a bitmask that names no single option, so read the set
+    // instead; a dynamic enum lists no options here, so its default cannot be named.
+    let is_flag = property
+        .getattr("is_enum_flag")
+        .and_then(|flag| flag.extract::<bool>())
+        .unwrap_or(false);
+    if kind == "ENUM" && is_flag {
+        if let Ok(flags) = property.getattr("default_flag") {
+            // A set iterates in per-process hash order; sort so the catalog revision
+            // stays stable across launches.
+            let mut names: Vec<String> = flags
+                .try_iter()
+                .into_iter()
+                .flatten()
+                .flatten()
+                .filter_map(|name| name.extract::<String>().ok())
+                .collect();
+            names.sort_unstable();
+            descriptor.insert("default".to_owned(), json!(names));
+        }
+    } else if !dynamic_items && let Ok(default) = property.getattr("default") {
         descriptor.insert("default".to_owned(), json_value(&default));
     }
     if kind == "INT" || kind == "FLOAT" {

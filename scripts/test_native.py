@@ -703,6 +703,40 @@ class NativeRnaTests(unittest.TestCase):
             self.operations.refresh_catalog()["revision"],
         )
 
+    def test_catalog_reads_enum_defaults_without_rna_warnings(self):
+        # Reading `default` on a flag enum or a dynamic enum makes Blender log "current
+        # value ... matches no enum" and yield '' -- about 130 lines on every launch.
+        def prop(idname, name):
+            return next(
+                p for p in native.describe_operator(idname)["properties"] if p["identifier"] == name
+            )
+
+        flag = prop("mesh.dissolve_limited", "delimit")
+        self.assertTrue(flag["enum_flag"])
+        self.assertEqual(flag["default"], ["NORMAL"])
+        dynamic = prop("transform.rotate", "orient_type")
+        self.assertTrue(dynamic["enum_items_dynamic"])
+        self.assertNotIn("default", dynamic)
+        self.assertEqual(prop("object.select_by_type", "type")["default"], "MESH")
+
+        # Count what Blender writes to stderr while the whole catalog is built.
+        sys.stderr.flush()
+        saved = os.dup(2)
+        with tempfile.TemporaryFile() as captured:
+            os.dup2(captured.fileno(), 2)
+            try:
+                native.build_catalog()
+            finally:
+                sys.stderr.flush()
+                os.dup2(saved, 2)
+                os.close(saved)
+            captured.seek(0)
+            warnings = [line for line in captured.read().decode(errors="replace").splitlines()
+                        if "matches no enum" in line]
+        # What remains are Blender operators whose declared default is not one of
+        # their own options, which only the read itself can reveal.
+        self.assertLessEqual(len(warnings), 12, "\n".join(warnings))
+
     def test_cancelled_render_does_not_capture_an_existing_output(self):
         render = bpy.context.scene.render
         previous_path = render.filepath
