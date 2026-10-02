@@ -274,10 +274,18 @@ impl BlenderOperations {
     /// Reject private and malformed RNA names before they reach `getattr`.
     fn public_name<'a>(python: Python<'_>, name: &'a str, kind: &str) -> PyResult<&'a str> {
         if name.is_empty() || name.starts_with('_') {
+            // Item access is how Python reaches custom properties; point at the
+            // supported route rather than leaving only a refusal.
+            let hint = match name {
+                "__getitem__" | "__setitem__" | "__delitem__" | "__contains__" => {
+                    "; for custom properties (obj[\"key\"]) use prop-get, prop-set!, prop-keys, or prop-delete!"
+                }
+                _ => "",
+            };
             return Err(operation_error(
                 python,
                 "access_denied",
-                format!("private or invalid RNA {kind}: '{name}'"),
+                format!("private or invalid RNA {kind}: '{name}'{hint}"),
             ));
         }
         Ok(name)
@@ -695,17 +703,33 @@ impl BlenderOperations {
             }
             _ => None,
         };
-        if matches!(
-            function,
-            "remove"
-                | "clear"
-                | "move"
-                | "add"
-                | "insert"
-                | "pop"
-                | "clear_geometry"
-                | "from_pydata"
-        ) {
+        // Removing node-tree data frees only the removed members; retire just their
+        // handles once the call succeeds. Anything else may shift its siblings.
+        let freed = if function == "remove" && is_rna_collection(target) {
+            let members: Vec<&Value> = request
+                .get("args")
+                .and_then(Value::as_array)
+                .into_iter()
+                .flatten()
+                .filter_map(|arg| arg.get("$rna_ref"))
+                .collect();
+            self.references.durable_member_pointers(python, &members)?
+        } else {
+            None
+        };
+        if freed.is_none()
+            && matches!(
+                function,
+                "remove"
+                    | "clear"
+                    | "move"
+                    | "add"
+                    | "insert"
+                    | "pop"
+                    | "clear_geometry"
+                    | "from_pydata"
+            )
+        {
             self.references.invalidate_collection(python, reference)?;
         } else if matches!(
             function,
@@ -717,6 +741,9 @@ impl BlenderOperations {
             self.references.prune_removed_modifiers(python);
         }
         let value = callable.call(PyTuple::new(python, args)?, kwargs.as_ref())?;
+        if let Some(pointers) = freed {
+            self.references.retire_pointers(&pointers);
+        }
         if is_rna_collection(target) && value.hasattr("bl_rna")? {
             self.references.insert_member(reference, &value)
         } else {

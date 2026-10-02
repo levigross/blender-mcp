@@ -561,9 +561,31 @@ class NativeRnaTests(unittest.TestCase):
             self.assertAlmostEqual(material.node_tree.nodes[self.get(node, "name")].inputs["Scale"].default_value, 7.5)
             self.assert_code("stale_reference", "rna_get", reference=vertex["$rna_ref"], attribute="co")
 
-            # Removal through MCP still retires the node's handles.
+            # Removing one node retires every handle to it -- including the alias reached
+            # through the link and its sockets -- but leaves its siblings usable, so a
+            # loop that removes nodes from a listed collection can keep going.
+            sibling = self.call(self.get(tree, "nodes"), "new", "ShaderNodeMath")
+            alias = self.get(link, "from_node")
             self.call(self.get(tree, "nodes"), "remove", node)
-            self.assert_code("stale_reference", "rna_get", reference=node["$rna_ref"], attribute="name")
+            for retired in (node, alias, scale):
+                self.assert_code("stale_reference", "rna_get", reference=retired["$rna_ref"], attribute="name")
+            self.assertEqual(self.get(sibling, "bl_idname"), "ShaderNodeMath")
+            # A failed removal retires nothing.
+            other = bpy.data.node_groups.new("MCP other tree", "ShaderNodeTree")
+            try:
+                with self.assertRaises(Exception):
+                    self.call(self.get(self.call(self.get(self.data, "node_groups"), "get", other.name), "nodes"), "remove", sibling)
+                self.assertEqual(self.get(sibling, "bl_idname"), "ShaderNodeMath")
+            finally:
+                bpy.data.node_groups.remove(other)
+
+            # Array-backed layers can shift on removal, so their siblings are retired.
+            mesh.uv_layers.new(name="first")
+            mesh.uv_layers.new(name="second")
+            layers = self.get(mesh_handle, "uv_layers")
+            first, second = self.items(layers)
+            self.call(layers, "remove", first)
+            self.assert_code("stale_reference", "rna_get", reference=second["$rna_ref"], attribute="name")
         finally:
             bpy.data.materials.remove(material)
             bpy.data.meshes.remove(mesh)
@@ -593,6 +615,10 @@ class NativeRnaTests(unittest.TestCase):
                 self.assert_code("access_denied", "id_property_set", reference=ref, key="mcp_registered", value=3)
             finally:
                 del bpy.types.Object.mcp_registered
+            with self.assertRaises(native.OperationError) as raised:
+                self.call(obj, "__setitem__", "role", "x")
+            self.assertEqual(raised.exception.code, "access_denied")
+            self.assertIn("prop-set!", str(raised.exception))
             for key in ("", "_RNA_UI", "x" * 64):
                 self.assert_code("invalid_arguments", "id_property_set", reference=ref, key=key, value=1)
             self.assert_code("invalid_arguments", "id_property_set", reference=ref, key="role", value=None)

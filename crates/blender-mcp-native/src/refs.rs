@@ -123,6 +123,53 @@ impl ReferenceStore {
         Ok(())
     }
 
+    /// Pointers of the members a `remove` call is about to free, when every one of them
+    /// is durable node-tree data; `None` means fall back to `invalidate_collection`.
+    /// Siblings of node-tree data are allocated separately, so removing one moves no
+    /// other; only the removed member's handles need retiring (see `retire_pointers`).
+    pub(crate) fn durable_member_pointers(
+        &self,
+        python: Python<'_>,
+        members: &[&Value],
+    ) -> PyResult<Option<Vec<u64>>> {
+        let mut pointers = Vec::with_capacity(members.len());
+        for reference in members {
+            let entry = self.entry(python, reference)?;
+            if !entry.locator.is_durable() {
+                return Ok(None);
+            }
+            match pointer(&self.resolve(python, reference)?) {
+                Some(address) => pointers.push(address),
+                None => return Ok(None),
+            }
+        }
+        Ok((!pointers.is_empty()).then_some(pointers))
+    }
+
+    /// Retire every handle to the freed members -- whichever path minted it -- and
+    /// everything resolved through one, so a later allocation at the same address can
+    /// never be reached through an old handle.
+    pub(crate) fn retire_pointers(&mut self, pointers: &[u64]) {
+        let freed: Vec<Arc<Locator>> = self
+            .entries
+            .values()
+            .filter(|entry| {
+                entry
+                    .locator
+                    .pointer()
+                    .is_some_and(|address| pointers.contains(&address))
+            })
+            .map(|entry| entry.locator.clone())
+            .collect();
+        self.entries.retain(|_, entry| {
+            !freed.iter().any(|target| {
+                Arc::ptr_eq(&entry.locator, target) || entry.locator.descends_from(target)
+            })
+        });
+        self.identities
+            .retain(|_, id| self.entries.contains_key(id));
+    }
+
     pub(crate) fn prune_removed_modifiers(&mut self, python: Python<'_>) {
         // Blender can reuse both persistent_uid and memory on new(). Retire
         // missing modifiers before allocation can make an old locator resolve
@@ -631,6 +678,25 @@ impl Locator {
             _ => false,
         }
     }
+    /// Durable node-tree data, resolved only through durable or ID steps.
+    fn is_durable(&self) -> bool {
+        matches!(
+            self,
+            Self::Member { durable: true, .. }
+                | Self::Path { durable: true, .. }
+                | Self::Attribute { durable: true, .. }
+        ) && !self.has_physical_subdata()
+    }
+
+    /// The address this handle was minted for, when it is pointer-checked.
+    fn pointer(&self) -> Option<u64> {
+        match self {
+            Self::Member { pointer, .. } | Self::Path { pointer, .. } => Some(*pointer),
+            Self::Attribute { pointer, .. } => *pointer,
+            _ => None,
+        }
+    }
+
     fn owner_uid(&self) -> Option<u64> {
         match self {
             Self::Id { uid, .. } => Some(*uid),

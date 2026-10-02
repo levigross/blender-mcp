@@ -105,7 +105,9 @@ How long a handle below an ID lasts depends on how Blender stores the data:
 - **Node-tree data** — nodes, sockets, links, and group interface items — is allocated
   one item at a time, so its handles survive operators, mode changes, and the
   depsgraph updates that editing a node triggers. A node graph can be built across
-  several evaluations. Removing a node through MCP retires its handles.
+  several evaluations. Removing a node through MCP retires every handle to that
+  node and its sockets, but not its siblings, so a loop can remove nodes from a
+  listed collection.
 - **Array-backed data** — mesh vertices, edges, polygons, loops, and layers — can be
   reallocated with a different element at the same address. Those handles are
   retired after any operator, mode change, keyframe edit, or geometry update; fetch
