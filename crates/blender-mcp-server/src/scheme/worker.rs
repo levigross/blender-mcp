@@ -439,6 +439,7 @@ fn process_request(
     }
 
     let user_forms = user_form_count(&request.code);
+    let defined = top_level_defines(&request.code);
     let run = run_with_watchdog(
         engine,
         request.code,
@@ -481,6 +482,12 @@ fn process_request(
         state,
         &request.context,
     );
+    let response = response.map_err(|mut error| {
+        if let Some(hint) = redefinition_hint(&error.message, &defined) {
+            error.message.push_str(&hint);
+        }
+        error
+    });
     request.reply.send(response).ok();
 }
 
@@ -721,6 +728,44 @@ fn user_form_count(code: &str) -> Option<usize> {
             .filter(|form| !matches!(form, ExprKind::Macro(_) | ExprKind::Require(_)))
             .count(),
     )
+}
+
+/// Names the program defines at its top level, for explaining compile errors.
+fn top_level_defines(code: &str) -> Vec<String> {
+    Parser::parse(code)
+        .map(|forms| {
+            forms
+                .iter()
+                .filter_map(|form| match form {
+                    ExprKind::Define(define) => define
+                        .name
+                        .atom_identifier()
+                        .map(|name| name.resolve().to_owned()),
+                    _ => None,
+                })
+                .collect()
+        })
+        .unwrap_or_default()
+}
+
+/// Steel gives every `define` a new binding, so a program that reads an existing
+/// global and then redefines it is rejected as a forward reference -- an error that
+/// does not mention the redefinition or the remedy.
+fn redefinition_hint(message: &str, defined: &[String]) -> Option<String> {
+    let name = message
+        .split("Cannot reference an identifier before its definition: ")
+        .nth(1)?
+        .split_whitespace()
+        .next()?;
+    defined.iter().any(|defined| defined == name).then(|| {
+        format!(
+            ". This evaluation also defines `{name}`, and in Steel a define creates a new \
+             binding, so earlier uses in the same evaluation cannot see the existing one. \
+             To wrap and replace a global, keep the old value and use set!: \
+             (define old-{name} {name}) (set! {name} (lambda ...)). \
+             Nothing was evaluated; existing definitions are unchanged."
+        )
+    })
 }
 
 /// Steel's lambda lifting hoists inner lambdas into synthetic top-level defines and
@@ -1127,6 +1172,40 @@ mod tests {
             .run("(set! f (lambda () 2))".to_owned())
             .expect("set!");
         assert_eq!(user_result(&mut engine, "(g)"), serde_json::json!(2));
+    }
+
+    #[test]
+    fn a_failed_redefinition_keeps_the_existing_global_and_explains_itself() {
+        // Regression (mattwparas/steel#713, pinned in Cargo.toml): reading a global and
+        // then redefining it in one evaluation fails to compile, and the failed build
+        // used to leave the name on an empty slot -- the working definition was lost.
+        let mut engine = Engine::new_sandboxed();
+        engine
+            .run("(define (hand-joints s) (* s 2))".to_owned())
+            .expect("defines");
+        let wrap = "(define HJ hand-joints) (define (hand-joints s) (+ (HJ s) 1))";
+        let error = engine.run(wrap.to_owned()).expect_err("forward reference");
+        assert_eq!(
+            user_result(&mut engine, "(hand-joints 3)"),
+            serde_json::json!(6)
+        );
+
+        let hint = redefinition_hint(&error.to_string(), &top_level_defines(wrap))
+            .expect("the redefinition is explained");
+        assert!(
+            hint.contains("set!") && hint.contains("hand-joints"),
+            "{hint}"
+        );
+        assert!(redefinition_hint(&error.to_string(), &[]).is_none());
+
+        // The remedy the hint gives works, in one evaluation.
+        engine
+            .run("(define HJ hand-joints) (set! hand-joints (lambda (s) (+ (HJ s) 1)))".to_owned())
+            .expect("set! replaces the global");
+        assert_eq!(
+            user_result(&mut engine, "(hand-joints 3)"),
+            serde_json::json!(7)
+        );
     }
 
     #[test]

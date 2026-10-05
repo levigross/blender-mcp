@@ -2003,7 +2003,7 @@ checksum = "a2eb9349b6444b326872e140eb1cf5e7c522154d69e7a0ffb0fb81c06b37543f"
 [[package]]
 name = "steel-core"
 version = "0.8.3"
-source = "git+https://github.com/levigross/steel?rev=76287970ed751282982f9749baba4dad6ec17166#76287970ed751282982f9749baba4dad6ec17166"
+source = "git+https://github.com/levigross/steel?rev=eacc1bbbcf413b6a4d366cca90147acb56b403cc#eacc1bbbcf413b6a4d366cca90147acb56b403cc"
 dependencies = [
  "arc-swap",
  "bigdecimal",
@@ -2055,7 +2055,7 @@ dependencies = [
 [[package]]
 name = "steel-derive"
 version = "0.8.3"
-source = "git+https://github.com/levigross/steel?rev=76287970ed751282982f9749baba4dad6ec17166#76287970ed751282982f9749baba4dad6ec17166"
+source = "git+https://github.com/levigross/steel?rev=eacc1bbbcf413b6a4d366cca90147acb56b403cc#eacc1bbbcf413b6a4d366cca90147acb56b403cc"
 dependencies = [
  "proc-macro2",
  "quote",
@@ -2065,7 +2065,7 @@ dependencies = [
 [[package]]
 name = "steel-gen"
 version = "0.8.3"
-source = "git+https://github.com/levigross/steel?rev=76287970ed751282982f9749baba4dad6ec17166#76287970ed751282982f9749baba4dad6ec17166"
+source = "git+https://github.com/levigross/steel?rev=eacc1bbbcf413b6a4d366cca90147acb56b403cc#eacc1bbbcf413b6a4d366cca90147acb56b403cc"
 dependencies = [
  "codegen",
  "serde",
@@ -2074,7 +2074,7 @@ dependencies = [
 [[package]]
 name = "steel-parser"
 version = "0.8.3"
-source = "git+https://github.com/levigross/steel?rev=76287970ed751282982f9749baba4dad6ec17166#76287970ed751282982f9749baba4dad6ec17166"
+source = "git+https://github.com/levigross/steel?rev=eacc1bbbcf413b6a4d366cca90147acb56b403cc#eacc1bbbcf413b6a4d366cca90147acb56b403cc"
 dependencies = [
  "compact_str",
  "dashmap",
@@ -2095,7 +2095,7 @@ dependencies = [
 [[package]]
 name = "steel-quickscope"
 version = "0.3.3"
-source = "git+https://github.com/levigross/steel?rev=76287970ed751282982f9749baba4dad6ec17166#76287970ed751282982f9749baba4dad6ec17166"
+source = "git+https://github.com/levigross/steel?rev=eacc1bbbcf413b6a4d366cca90147acb56b403cc#eacc1bbbcf413b6a4d366cca90147acb56b403cc"
 dependencies = [
  "indexmap 2.14.1",
  "smallvec",

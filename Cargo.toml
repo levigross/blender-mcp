@@ -57,10 +57,11 @@ opt-level = 3
 # so unwinding must stay enabled; `panic = "abort"` would take the server down instead.
 strip = "symbols"
 
-# Constant evaluation and function inlining copy top-level defines into code compiled
-# alongside them, so a `set!` in a later evaluation is invisible to that code. Fix
-# pending upstream as https://github.com/mattwparas/steel/pull/707; this rev is
-# steel-core 0.8.3 plus its two commits. Drop the patch (and the deny.toml
-# allow-git entry) once a release includes it.
+# steel-core 0.8.3 plus fixes pending upstream:
+# - mattwparas/steel#707: constant evaluation and function inlining copied top-level
+#   defines into code compiled alongside them, so a later `set!` was invisible to it.
+# - mattwparas/steel#713: a program that failed to build lost every existing global
+#   it redefined.
+# Drop the patch (and the deny.toml allow-git entry) once a release includes both.
 [patch.crates-io]
-steel-core = { git = "https://github.com/levigross/steel", rev = "76287970ed751282982f9749baba4dad6ec17166" }
+steel-core = { git = "https://github.com/levigross/steel", rev = "eacc1bbbcf413b6a4d366cca90147acb56b403cc" }

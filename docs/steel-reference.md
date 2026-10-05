@@ -30,6 +30,15 @@ evaluated afterwards sees it, but functions defined before it keep the old one.
 (set! step (lambda () 0))                       ; replaces step for its callers too
 ```
 
+To wrap an existing function, keep the old value and `set!` the name; reading a name
+and then `define`-ing it in the same call is rejected, and leaves the old definition
+in place:
+
+```scheme
+(define old-step step)
+(set! step (lambda () (+ (old-step) 1)))
+```
+
 Every top-level expression contributes a value; several expressions return a list of
 them. `define` evaluates to `#<void>`, so a script of definitions returns a row of
 voids — harmless, but wrap the interesting value last if you want a clean result.
