@@ -358,7 +358,7 @@
 (define (unparent! child)
   (refresh!)
   (let ([world (rna-get child "matrix_world")])
-    (rna-set! child "parent" (void))
+    (rna-set! child "parent" void)
     (rna-set! child "matrix_world" world))
   child)
 

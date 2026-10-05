@@ -1,5 +1,5 @@
 use std::{
-    collections::BTreeMap,
+    collections::{BTreeMap, HashSet},
     fmt::Write as _,
     sync::{
         Arc, Mutex, RwLock,
@@ -88,6 +88,11 @@ pub(super) struct BindingState {
     pub catalog_revision: RwLock<String>,
     pub potentially_continuing: AtomicBool,
     pub events_truncated: AtomicBool,
+    /// Global names defined by the engine itself (prelude, primitives, stdlib, operator
+    /// aliases), captured when it is built; everything else is the user's.
+    pub builtin_names: RwLock<HashSet<String>>,
+    /// Every global name after the latest evaluation, for `apropos`.
+    pub global_names: RwLock<Vec<String>>,
 }
 
 impl BindingState {
@@ -101,6 +106,8 @@ impl BindingState {
             artifacts: Mutex::new(Vec::new()),
             potentially_continuing: AtomicBool::new(false),
             events_truncated: AtomicBool::new(false),
+            builtin_names: RwLock::new(HashSet::new()),
+            global_names: RwLock::new(Vec::new()),
         }
     }
 
@@ -528,6 +535,25 @@ fn register_runtime_functions(
     deadline: &EvalDeadline,
     state: &Arc<BindingState>,
 ) {
+    let names = Arc::clone(state);
+    engine.register_fn(
+        "apropos",
+        move |pattern: String| -> Result<SteelVal, SteelErr> {
+            let names = names
+                .global_names
+                .read()
+                .map_err(|_| steel_error("global name list is poisoned"))?;
+            let mut found: Vec<&String> = names
+                .iter()
+                .filter(|name| name.contains(pattern.as_str()))
+                .collect();
+            found.sort_unstable();
+            found.dedup();
+            found.truncate(500);
+            json_to_steel(&serde_json::json!(found))
+        },
+    );
+
     let invoke = Invocation::new(bridge, runtime, deadline, state);
     engine.register_fn("blender-status", move || -> Result<SteelVal, SteelErr> {
         invoke.call(BridgeOperation::Status)

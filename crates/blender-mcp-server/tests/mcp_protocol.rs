@@ -872,6 +872,48 @@ async fn background_requires_capability_without_executing_code() {
 }
 
 #[tokio::test]
+async fn redefining_a_user_function_reaches_its_callers() {
+    let server = TestServer::start().await;
+    evaluate(&server, "(define (helper) 1) (define (caller) (helper))").await;
+    evaluate(&server, "(define (helper) 2)").await;
+    assert_eq!(
+        structured(&evaluate(&server, "(caller)").await)["result"],
+        2
+    );
+    // Wrap and replace in one evaluation: the old value is read first.
+    let wrapped = evaluate(
+        &server,
+        "(define old-helper helper) (define (helper) (+ (old-helper) 10)) 7",
+    )
+    .await;
+    assert_eq!(
+        structured(&wrapped)["result"],
+        json!([null, null, 7]),
+        "{wrapped:?}"
+    );
+    assert_eq!(
+        structured(&evaluate(&server, "(caller)").await)["result"],
+        12
+    );
+    assert!(structured(&wrapped).get("warnings").is_none());
+
+    // A builtin keeps working for the stdlib; the user is told why.
+    let shadowed = evaluate(&server, "(define (cos x) 99)").await;
+    let warnings = structured(&shadowed)["warnings"].to_string();
+    assert!(warnings.contains("`cos`"), "{shadowed:?}");
+    let ring = evaluate(&server, "(car (ring 4 1.0 0.0))").await;
+    assert_eq!(structured(&ring)["result"], json!([1.0, 0.0, 0.0]));
+
+    let found = evaluate(&server, r#"(apropos "node-tree")"#).await;
+    assert!(
+        structured(&found)["result"]
+            .to_string()
+            .contains("node-tree!")
+    );
+    server.shutdown().await;
+}
+
+#[tokio::test]
 async fn an_abandoned_evaluation_finishes_and_is_reported_on_the_next_call() {
     // A client that gives up mid-evaluation (Claude Code abandons tool calls after
     // about 60 s) used to cancel it, leaving Blender half-changed.

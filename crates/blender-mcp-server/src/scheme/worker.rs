@@ -28,7 +28,7 @@ use super::{
         BindingState, EvalDeadline, EvaluationContext, GeneratedArtifact, install_operator_aliases,
         register_all, seal_sandbox, validate_source,
     },
-    marshal,
+    marshal, redefine,
 };
 
 const REQUEST_CAPACITY: usize = 32;
@@ -66,6 +66,9 @@ pub struct SchemeEvalReply {
     pub events_truncated: bool,
     pub artifacts: Vec<GeneratedArtifact>,
     pub catalog_revision: String,
+    /// Notes about how the code was evaluated, such as a builtin being redefined.
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub warnings: Vec<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Error)]
@@ -462,9 +465,11 @@ fn process_request(
 
     let user_forms = user_form_count(&request.code);
     let defined = top_level_defines(&request.code);
+    let rewritten = prepare_source(engine, state, &request.code);
+    let warnings = rewritten.warnings;
     let run = run_with_watchdog(
         engine,
-        request.code,
+        rewritten.source,
         request
             .context
             .deadline
@@ -504,12 +509,20 @@ fn process_request(
         state,
         &request.context,
     );
-    let response = response.map_err(|mut error| {
-        if let Some(hint) = redefinition_hint(&error.message, &defined) {
-            error.message.push_str(&hint);
-        }
-        error
-    });
+    if let Ok(mut globals) = state.global_names.write() {
+        *globals = global_names(engine);
+    }
+    let response = response
+        .map(|mut reply| {
+            reply.warnings = warnings;
+            reply
+        })
+        .map_err(|mut error| {
+            if let Some(hint) = redefinition_hint(&error.message, &defined) {
+                error.message.push_str(&hint);
+            }
+            error
+        });
     request.reply.send(response).ok();
 }
 
@@ -714,7 +727,32 @@ fn evaluation_reply(
         events_truncated: state.events_truncated.load(Ordering::Acquire),
         artifacts,
         catalog_revision,
+        warnings: Vec::new(),
     }
+}
+
+/// A define of an existing user name updates it (see redefine.rs).
+fn prepare_source(engine: &Engine, state: &BindingState, code: &str) -> redefine::Rewritten {
+    match state.builtin_names.read() {
+        Ok(builtins) => redefine::rewrite(
+            code,
+            |name| !builtins.contains(name) && engine.global_exists(name),
+            |name| builtins.contains(name),
+        ),
+        Err(_) => redefine::Rewritten {
+            source: code.to_owned(),
+            warnings: Vec::new(),
+        },
+    }
+}
+
+/// Every readable global name, as Steel reports them.
+fn global_names(engine: &Engine) -> Vec<String> {
+    engine
+        .readable_globals(0)
+        .iter()
+        .map(|name| name.resolve().to_owned())
+        .collect()
 }
 
 fn build_engine(
@@ -730,6 +768,13 @@ fn build_engine(
     engine.run(PRELUDE)?;
     engine.run(STDLIB)?;
     install_operator_aliases(&mut engine, catalog)?;
+    let names = global_names(&engine);
+    if let Ok(mut builtins) = state.builtin_names.write() {
+        *builtins = names.iter().cloned().collect();
+    }
+    if let Ok(mut globals) = state.global_names.write() {
+        *globals = names;
+    }
     Ok(engine)
 }
 
