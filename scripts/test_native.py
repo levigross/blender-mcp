@@ -591,6 +591,29 @@ class NativeRnaTests(unittest.TestCase):
             bpy.data.curves.remove(curve)
             bpy.data.armatures.remove(armature)
 
+    def test_flag_enums_accept_lists(self):
+        # Scheme and JSON have no sets; flag enums need one. A list used to be passed
+        # through as-is and Blender rejected it, e.g. bake pass_filter.
+        tools = self.get(self.get(self.context, "scene"), "tool_settings")
+        previous = set(bpy.context.scene.tool_settings.snap_elements)
+        try:
+            self.set_value(tools, "snap_elements", ["VERTEX", "EDGE"])
+            self.assertEqual(bpy.context.scene.tool_settings.snap_elements, {"VERTEX", "EDGE"})
+        finally:
+            bpy.context.scene.tool_settings.snap_elements = previous
+        result = self.execute(
+            "operator_call", idname="object.align", kwargs={"align_axis": ["X", "Z"]}
+        )
+        self.assertEqual(result["operator"], "object.align")
+        # Ordinary list properties are unchanged.
+        obj = bpy.data.objects.new("MCP flag list", None)
+        try:
+            handle = self.call(self.get(self.data, "objects"), "get", obj.name)
+            self.set_value(handle, "location", [1.0, 2.0, 3.0])
+            self.assertEqual(tuple(obj.location), (1.0, 2.0, 3.0))
+        finally:
+            bpy.data.objects.remove(obj)
+
     def test_node_handles_survive_subdata_invalidation(self):
         # Editing a node fires a shading depsgraph update, which marks sub-data dirty.
         # Node-tree data is individually allocated, so its handles must survive that;

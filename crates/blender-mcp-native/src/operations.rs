@@ -6,7 +6,7 @@
 
 use pyo3::{
     prelude::*,
-    types::{PyBool, PyDict, PyFloat, PyInt, PyList, PyString, PyTuple},
+    types::{PyBool, PyDict, PyFloat, PyInt, PyList, PySet, PyString, PyTuple},
 };
 use serde_json::{Map, Value, json};
 use sha2::{Digest, Sha256};
@@ -473,6 +473,12 @@ impl BlenderOperations {
         let kwargs = kwargs.cast::<PyDict>().map_err(|_| {
             operation_error(python, "invalid_arguments", "kwargs must be an object")
         })?;
+        flag_lists_to_sets(
+            kwargs,
+            &operator
+                .call_method0("get_rna_type")?
+                .getattr("properties")?,
+        )?;
 
         let execution_context = request.get("execution_context").and_then(Value::as_str);
         let undo = request.get("undo").and_then(Value::as_bool);
@@ -531,6 +537,10 @@ impl BlenderOperations {
                         .import("mathutils")?
                         .getattr("Matrix")?
                         .call1((value,))?
+                } else if value.is_instance_of::<PyList>()
+                    && rna_property(&target, attribute).is_some_and(|p| is_flag_enum(&p))
+                {
+                    PySet::new(python, value.try_iter()?.collect::<PyResult<Vec<_>>>()?)?.into_any()
                 } else {
                     value
                 };
@@ -701,7 +711,16 @@ impl BlenderOperations {
         let kwargs = match request.get("kwargs") {
             Some(value @ Value::Object(_)) => {
                 let mapping = self.deserialize(python, value)?;
-                Some(mapping.cast::<PyDict>()?.clone())
+                let mapping = mapping.cast::<PyDict>()?.clone();
+                if let Ok(parameters) = target
+                    .getattr("bl_rna")
+                    .and_then(|rna| rna.getattr("functions"))
+                    .and_then(|functions| functions.call_method1("get", (function,)))
+                    .and_then(|found| found.getattr("parameters"))
+                {
+                    flag_lists_to_sets(&mapping, &parameters)?;
+                }
+                Some(mapping)
             }
             _ => None,
         };
@@ -1305,6 +1324,46 @@ fn is_row_matrix(value: &Value) -> bool {
             row.as_array()
                 .is_some_and(|row| row.len() == width && row.iter().all(Value::is_number))
         })
+}
+
+fn rna_property<'py>(target: &Bound<'py, PyAny>, attribute: &str) -> Option<Bound<'py, PyAny>> {
+    target
+        .getattr("bl_rna")
+        .and_then(|rna| rna.getattr("properties"))
+        .and_then(|properties| properties.call_method1("get", (attribute,)))
+        .ok()
+        .filter(|property| !property.is_none())
+}
+
+/// Flag enums take a Python set, but Scheme and JSON have only lists.
+fn is_flag_enum(property: &Bound<'_, PyAny>) -> bool {
+    property
+        .getattr("type")
+        .and_then(|kind| kind.extract::<String>())
+        .is_ok_and(|kind| kind == "ENUM")
+        && property
+            .getattr("is_enum_flag")
+            .and_then(|flag| flag.extract::<bool>())
+            .unwrap_or(false)
+}
+
+/// Turn list values into sets wherever `properties` (an RNA property collection, such
+/// as an operator's or a function's parameters) declares a flag enum.
+fn flag_lists_to_sets(kwargs: &Bound<'_, PyDict>, properties: &Bound<'_, PyAny>) -> PyResult<()> {
+    let flagged: Vec<(Bound<'_, PyAny>, Bound<'_, PyAny>)> = kwargs
+        .iter()
+        .filter(|(key, value)| {
+            value.is_instance_of::<PyList>()
+                && properties
+                    .call_method1("get", (key,))
+                    .is_ok_and(|property| !property.is_none() && is_flag_enum(&property))
+        })
+        .collect();
+    for (key, value) in flagged {
+        let members = value.try_iter()?.collect::<PyResult<Vec<_>>>()?;
+        kwargs.set_item(key, PySet::new(kwargs.py(), members)?)?;
+    }
+    Ok(())
 }
 
 fn is_matrix_property(target: &Bound<'_, PyAny>, attribute: &str) -> bool {
