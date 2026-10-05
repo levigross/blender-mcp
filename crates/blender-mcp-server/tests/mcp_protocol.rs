@@ -872,6 +872,44 @@ async fn background_requires_capability_without_executing_code() {
 }
 
 #[tokio::test]
+async fn an_abandoned_evaluation_finishes_and_is_reported_on_the_next_call() {
+    // A client that gives up mid-evaluation (Claude Code abandons tool calls after
+    // about 60 s) used to cancel it, leaving Blender half-changed.
+    let server = TestServer::start().await;
+    let client = server.connect().await;
+    let slow = tokio::spawn(async move {
+        client
+            .call_tool(
+                CallToolRequestParams::new("scheme_eval").with_arguments(
+                    json!({"code": r#"(op-call "test.slow" (hash)) (op-call "test.slow" (hash))
+                                       (op-call "test.slow" (hash)) (define abandoned-marker 42)"#})
+                    .as_object()
+                    .expect("arguments object")
+                    .clone(),
+                ),
+            )
+            .await
+    });
+    tokio::time::sleep(Duration::from_millis(150)).await;
+    slow.abort();
+    tokio::time::sleep(Duration::from_millis(900)).await;
+
+    let next = evaluate(&server, "abandoned-marker").await;
+    assert_eq!(structured(&next)["result"], 42, "{next:?}");
+    let previous = &structured(&next)["previous_abandoned"];
+    assert_eq!(previous["outcome"], "completed", "{next:?}");
+    assert!(
+        previous["code"]
+            .as_str()
+            .is_some_and(|code| code.contains("abandoned-marker"))
+    );
+    // Reported once.
+    let after = evaluate(&server, "(+ 1 1)").await;
+    assert!(structured(&after).get("previous_abandoned").is_none());
+    server.shutdown().await;
+}
+
+#[tokio::test]
 async fn background_survives_disconnect_and_preserves_tool_results() {
     let server = TestServer::start().await;
     let client = server.connect_tasks().await;

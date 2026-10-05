@@ -18,7 +18,7 @@ use serde::Deserialize;
 
 use crate::{
     resources,
-    scheme::SchemeHandle,
+    scheme::{SchemeEvalError, SchemeEvalReply, SchemeHandle},
     sessions::{DEFAULT_SESSION, Sessions, artifact_uri},
     tasks::Tasks,
 };
@@ -80,28 +80,109 @@ impl BlenderMcp {
         Parameters(parameters): Parameters<SchemeEvalParams>,
         context: RequestContext<RoleServer>,
     ) -> Result<CallToolResult, McpError> {
-        let worker = self.sessions.get(parameters.session.as_deref())?;
-        evaluate_scheme(worker, parameters, context.ct.clone()).await
+        let worker = self.sessions.get(parameters.session.as_deref())?.clone();
+        let session = parameters
+            .session
+            .clone()
+            .unwrap_or_else(|| DEFAULT_SESSION.to_owned());
+        let excerpt: String = parameters.code.chars().take(240).collect();
+        // The evaluation owns its cancellation, not the HTTP request: a client that
+        // gives up (Claude Code abandons tool calls after about 60 s) must not leave
+        // a graph or mesh half-built. It still ends at its own timeout_secs.
+        let detached = worker.clone();
+        let mut evaluation = tokio::spawn(async move {
+            run_evaluation(
+                &detached,
+                parameters,
+                tokio_util::sync::CancellationToken::new(),
+            )
+            .await
+        });
+        tokio::select! {
+            outcome = &mut evaluation => {
+                let outcome = outcome.map_err(|error| {
+                    McpError::internal_error(format!("scheme_eval task failed: {error}"), None)
+                })?;
+                render_evaluation(&worker, &session, outcome)
+            }
+            () = context.ct.cancelled() => {
+                tokio::spawn(async move {
+                    if let Ok(outcome) = evaluation.await {
+                        worker.record_abandoned(abandoned_summary(&excerpt, &outcome));
+                    }
+                });
+                Err(McpError::internal_error(
+                    "client disconnected; the evaluation continues and its outcome is reported on the next scheme_eval in this session",
+                    None,
+                ))
+            }
+        }
     }
 }
 
+/// Summarise an evaluation nobody was waiting for, for the next reply.
+fn abandoned_summary(
+    code: &str,
+    outcome: &Result<SchemeEvalReply, SchemeEvalError>,
+) -> serde_json::Value {
+    let finished = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map_or(0, |elapsed| elapsed.as_millis());
+    match outcome {
+        Ok(reply) => serde_json::json!({
+            "code": code,
+            "outcome": "completed",
+            "display": reply.display.chars().take(2000).collect::<String>(),
+            "result_complete": reply.result_complete,
+            "metrics": reply.metrics,
+            "finished_unix_ms": finished,
+        }),
+        Err(error) => serde_json::json!({
+            "code": code,
+            "outcome": "failed",
+            "error": {"code": error.code, "message": error.message},
+            "finished_unix_ms": finished,
+        }),
+    }
+}
+
+/// Evaluate and render, for callers that own their cancellation (background tasks).
 pub(crate) async fn evaluate_scheme(
     worker: &SchemeHandle,
     parameters: SchemeEvalParams,
     cancellation: tokio_util::sync::CancellationToken,
 ) -> Result<CallToolResult, McpError> {
-    let timeout = parameters.timeout_secs.map(Duration::from_secs);
-    let session = parameters.session.as_deref().unwrap_or(DEFAULT_SESSION);
-    match worker
+    let session = parameters
+        .session
+        .clone()
+        .unwrap_or_else(|| DEFAULT_SESSION.to_owned());
+    let outcome = run_evaluation(worker, parameters, cancellation).await;
+    render_evaluation(worker, &session, outcome)
+}
+
+async fn run_evaluation(
+    worker: &SchemeHandle,
+    parameters: SchemeEvalParams,
+    cancellation: tokio_util::sync::CancellationToken,
+) -> Result<SchemeEvalReply, SchemeEvalError> {
+    worker
         .evaluate(
             parameters.code,
-            timeout,
+            parameters.timeout_secs.map(Duration::from_secs),
             parameters.reset.unwrap_or(false),
             parameters.include_events.unwrap_or(false),
             cancellation,
         )
         .await
-    {
+}
+
+fn render_evaluation(
+    worker: &SchemeHandle,
+    session: &str,
+    outcome: Result<SchemeEvalReply, SchemeEvalError>,
+) -> Result<CallToolResult, McpError> {
+    let previous = worker.take_abandoned();
+    match outcome {
         Ok(reply) => {
             let mut structured = serde_json::to_value(&reply).map_err(|error| {
                 McpError::internal_error(
@@ -110,6 +191,9 @@ pub(crate) async fn evaluate_scheme(
                 )
             })?;
             structured["session"] = serde_json::json!(session);
+            if let Some(previous) = previous {
+                structured["previous_abandoned"] = previous;
+            }
             if let Some(artifacts) = structured["artifacts"].as_array_mut() {
                 for artifact in artifacts {
                     if let Some(id) = artifact["id"].as_str() {
@@ -148,6 +232,9 @@ pub(crate) async fn evaluate_scheme(
                 )
             })?;
             structured["session"] = serde_json::json!(session);
+            if let Some(previous) = previous {
+                structured["previous_abandoned"] = previous;
+            }
             let mut result = CallToolResult::structured_error(structured);
             result.content = vec![ContentBlock::text(error.to_string())];
             Ok(result)

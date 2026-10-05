@@ -152,6 +152,8 @@ pub struct SchemeHandle {
     status: Arc<SharedStatus>,
     state: Arc<BindingState>,
     bridge: Arc<dyn BlenderBridge>,
+    /// Outcome of an evaluation whose client went away, reported once on the next.
+    abandoned: Arc<std::sync::Mutex<Option<Value>>>,
 }
 
 impl std::fmt::Debug for SchemeHandle {
@@ -164,6 +166,19 @@ impl std::fmt::Debug for SchemeHandle {
 }
 
 impl SchemeHandle {
+    /// Keep the outcome of an evaluation whose client disconnected, replacing any
+    /// earlier one that was never collected.
+    pub fn record_abandoned(&self, summary: Value) {
+        if let Ok(mut slot) = self.abandoned.lock() {
+            *slot = Some(summary);
+        }
+    }
+
+    /// The pending abandoned outcome, handed out once.
+    pub fn take_abandoned(&self) -> Option<Value> {
+        self.abandoned.lock().ok().and_then(|mut slot| slot.take())
+    }
+
     pub(crate) fn evaluation_timeout(
         &self,
         timeout_override: Option<Duration>,
@@ -335,6 +350,7 @@ impl SchemeWorker {
                 status,
                 state,
                 bridge: handle_bridge,
+                abandoned: Arc::default(),
             },
             join: Some(join),
         })
