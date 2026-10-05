@@ -246,9 +246,8 @@
 
 ;; Split a list into pieces of at most `size`.
 ;;
-;; Arguments travel to Blender through the same 10,000-item budget as results come
-;; back through, so one call cannot carry a large buffer: a mesh of a few thousand
-;; vertices is already three numbers each. Build it in pieces.
+;; Arguments travel to Blender in one request of at most 2 MiB (about 14,000 vertex
+;; coordinates), so build anything larger in pieces.
 (define (chunk items size)
   (unless (and (integer? size) (> size 0))
     (error "chunk size must be a positive integer"))
@@ -574,7 +573,7 @@
   (let ([data (prism-data sides radius height)])
     (apply mesh-from-data! name (list-ref data 0) (list-ref data 1) collection)))
 
-;; A `size`-square grid centred on the origin whose z is (height-at x y). About 30 x 30
+;; A `size`-square grid centred on the origin whose z is (height-at x y). About 80 x 80
 ;; cells fits in one call; tile larger terrain into several objects.
 (define (heightfield-data columns rows size height-at)
   (let* ([extent (exact->inexact size)]

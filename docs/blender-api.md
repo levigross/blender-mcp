@@ -265,15 +265,12 @@ also restores resolution after ordinary Scheme errors; timeout cancellation can
 prevent further cleanup. Multiview and filename templates are not covered by the
 still-render helper; use the Blender operator for those workflows.
 
-## The item budget applies in both directions
+## Large data moves in pages
 
-The 10,000-item marshalling limit is easy to read as a cap on results. It is not — the
-same budget is spent converting **arguments on the way to Blender**, so one call cannot
-carry a large buffer either. Vertex coordinates are three numbers each, so a few
-thousand vertices exhausts it, and `foreach_set` uploads fail at exactly the point a
-procedural mesh gets interesting.
-
-Move large data in pages instead. Blender's `foreach_get`/`foreach_set` always cover a
+Results are bounded at 10,000 items and 256 KiB. Arguments on the way to Blender have
+a separate, larger budget matching the bridge's 2 MiB request limit (100,000 items):
+about 14,000 vertex coordinates, or a heightfield of roughly 80 × 80 cells with its
+faces, fit in one call. Past that, and for anything read back, move data in pages. Blender's `foreach_get`/`foreach_set` always cover a
 whole collection, so they cannot be split into ranges by hand; `collection-read` and
 `collection-write!` page one attribute of any collection for you, and the stdlib
 builds on them:

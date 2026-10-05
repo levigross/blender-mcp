@@ -1265,8 +1265,8 @@ mod tests {
 
     #[test]
     fn chunk_splits_without_losing_or_duplicating_items() {
-        // Arguments share the 10,000-item marshalling budget with results, so a large
-        // upload has to be split; losing an element here would silently corrupt a mesh.
+        // Arguments are bounded by the bridge request size, so a large upload has to be
+        // split; losing an element here would silently corrupt a mesh.
         let mut engine = stdlib_engine();
         let sizes = number_list(&mut engine, "(map length (chunk (range 0 7) 3))");
         assert_eq!(sizes, vec![3.0, 3.0, 1.0]);

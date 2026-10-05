@@ -226,9 +226,8 @@ lists, so it can be inspected or transformed before anything reaches Blender:
 (heightfield-data columns rows size height-at)
 ```
 
-A call carries at most 10,000 items. Vertices cost four each (three numbers and
-their list), and quads five, so about 30 × 30 heightfield cells fit in one object;
-tile larger surfaces.
+Arguments to Blender are bounded by the bridge's 2 MiB request, so roughly 80 × 80
+heightfield cells fit in one object; tile larger surfaces.
 
 ## Animation
 
@@ -324,9 +323,8 @@ expression after it.
 
 The chunk size must be a positive integer.
 
-The 10,000-item budget is spent on arguments travelling **to** Blender as well as on
-results coming back, so one call cannot carry a large buffer. Vertex coordinates are
-three numbers each, so a few thousand vertices exhausts it. Build new meshes in
+Results are bounded at 10,000 items; arguments travelling **to** Blender at the
+bridge's 2 MiB request (about 14,000 vertex coordinates). Build larger meshes in
 pieces, and read or rewrite existing ones in pages:
 
 ```scheme

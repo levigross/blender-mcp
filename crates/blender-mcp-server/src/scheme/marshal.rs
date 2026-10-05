@@ -11,6 +11,10 @@ use steel::{
 const MAX_DEPTH: usize = 16;
 const MAX_ITEMS: usize = 10_000;
 const MAX_OUTPUT_BYTES: usize = 256 * 1024;
+/// Arguments bound for Blender are limited by the bridge's own request size (2 MiB),
+/// not by what is readable in a reply: a node graph or mesh sent in one call must fit.
+const MAX_ARGUMENT_BYTES: usize = 2 * 1024 * 1024;
+const MAX_ARGUMENT_ITEMS: usize = 100_000;
 
 struct Budget {
     items: usize,
@@ -22,6 +26,13 @@ impl Budget {
         Self {
             items: MAX_ITEMS,
             bytes: MAX_OUTPUT_BYTES,
+        }
+    }
+
+    const fn for_arguments() -> Self {
+        Self {
+            items: MAX_ARGUMENT_ITEMS,
+            bytes: MAX_ARGUMENT_BYTES,
         }
     }
 
@@ -103,8 +114,9 @@ fn json_to_steel_inner(
     }
 }
 
+/// Convert an argument bound for Blender (see `MAX_ARGUMENT_BYTES`).
 pub(super) fn steel_to_json(value: &SteelVal) -> Result<JsonValue, SteelErr> {
-    let mut remaining = Budget::new();
+    let mut remaining = Budget::for_arguments();
     steel_to_json_inner(value, 0, &mut remaining)
 }
 
@@ -324,6 +336,23 @@ mod tests {
     #[test]
     fn rejects_non_finite_numbers() {
         assert!(steel_to_json(&SteelVal::NumV(f64::NAN)).is_err());
+    }
+
+    #[test]
+    fn arguments_get_the_bridge_budget_and_results_keep_theirs() {
+        // A node graph or mesh sent to Blender in one call is bounded by the bridge's
+        // 2 MiB request, not by the 10,000 items a readable reply allows.
+        let large = SteelVal::ListV((0..20_000).map(SteelVal::IntV).collect());
+        assert_eq!(
+            steel_to_json(&large)
+                .expect("argument converts")
+                .as_array()
+                .map(Vec::len),
+            Some(20_000)
+        );
+        assert!(values_to_json(std::slice::from_ref(&large)).is_err());
+        let too_large = SteelVal::ListV((0..200_000).map(SteelVal::IntV).collect());
+        assert!(steel_to_json(&too_large).is_err());
     }
 
     #[test]

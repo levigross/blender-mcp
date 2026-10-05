@@ -30,10 +30,10 @@ A real Blender catalogs around 2,500 operators with some 6,200 properties betwee
 them, which is far past those limits, so the discovery functions below return
 names and summaries rather than whole descriptors.
 
-The item budget applies **in both directions**. It is spent converting arguments
-on the way to Blender as well as results on the way back, so a single call cannot
-carry a large buffer either — a few thousand vertex coordinates already exhausts
-it. Split the work with `(chunk items size)`.
+Arguments on the way to Blender have their own budget, matching the bridge's 2 MiB
+request limit (100,000 items and 2 MiB): about 14,000 vertex coordinates fit in one
+call. Split anything larger with `(chunk items size)`, and read large collections in
+pages with `collection-read`.
 
 Two more fields appear when they apply. `warnings` lists notes about how the code was
 evaluated, such as a builtin name being redefined. `previous_abandoned` reports, once,
