@@ -28,7 +28,7 @@ use super::{
         BindingState, EvalDeadline, EvaluationContext, GeneratedArtifact, install_operator_aliases,
         register_all, seal_sandbox, validate_source,
     },
-    marshal, redefine,
+    library, marshal, redefine,
 };
 
 const REQUEST_CAPACITY: usize = 32;
@@ -50,6 +50,8 @@ const STDLIB: &str = include_str!("stdlib.scm");
 pub struct SchemeSettings {
     pub default_timeout: Duration,
     pub maximum_timeout: Duration,
+    /// Read-only directory whose `name.scm` files `(use "name")` loads.
+    pub library: Option<&'static std::path::Path>,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -332,6 +334,7 @@ impl SchemeWorker {
             .spawn(move || {
                 worker_main(
                     rx,
+                    settings.library,
                     &bridge,
                     &runtime,
                     &thread_state,
@@ -377,6 +380,7 @@ impl SchemeWorker {
 
 fn worker_main(
     mut rx: mpsc::Receiver<WorkerMessage>,
+    library: Option<&'static std::path::Path>,
     bridge: &Arc<dyn BlenderBridge>,
     runtime: &tokio::runtime::Handle,
     state: &Arc<BindingState>,
@@ -404,7 +408,15 @@ fn worker_main(
             WorkerMessage::Evaluate(request) => {
                 status.queued.fetch_sub(1, Ordering::AcqRel);
                 status.state.store(SharedStatus::BUSY, Ordering::Release);
-                process_request(&mut engine, request, bridge, runtime, &deadline, state);
+                process_request(
+                    &mut engine,
+                    request,
+                    library,
+                    bridge,
+                    runtime,
+                    &deadline,
+                    state,
+                );
                 status.state.store(SharedStatus::READY, Ordering::Release);
             }
             WorkerMessage::Shutdown(done) => {
@@ -420,6 +432,7 @@ fn worker_main(
 fn process_request(
     engine: &mut Engine,
     request: EvalRequest,
+    library: Option<&'static std::path::Path>,
     bridge: &Arc<dyn BlenderBridge>,
     runtime: &tokio::runtime::Handle,
     deadline: &EvalDeadline,
@@ -465,11 +478,16 @@ fn process_request(
 
     let user_forms = user_form_count(&request.code);
     let defined = top_level_defines(&request.code);
-    let rewritten = prepare_source(engine, state, &request.code);
-    let warnings = rewritten.warnings;
+    let (program, warnings) = match prepare_program(engine, state, &request.code, library) {
+        Ok(prepared) => prepared,
+        Err(error) => {
+            request.reply.send(Err(error)).ok();
+            return;
+        }
+    };
     let run = run_with_watchdog(
         engine,
-        rewritten.source,
+        program,
         request
             .context
             .deadline
@@ -731,6 +749,24 @@ fn evaluation_reply(
     }
 }
 
+/// Expand `(use "name")` forms, check the whole program against the sandbox (library
+/// files included), and rewrite redefinitions. Returns the source to run and warnings.
+fn prepare_program(
+    engine: &Engine,
+    state: &BindingState,
+    code: &str,
+    library: Option<&'static std::path::Path>,
+) -> Result<(String, Vec<String>), SchemeEvalError> {
+    let expanded = library::expand(code, library, &|text| prepare_source(engine, state, text))
+        .map_err(|message| SchemeEvalError::new("library_error", message))?;
+    validate_source(&expanded.source)
+        .map_err(|message| SchemeEvalError::new("sandbox_violation", message))?;
+    let rewritten = prepare_source(engine, state, &expanded.source);
+    let mut warnings = expanded.warnings;
+    warnings.extend(rewritten.warnings);
+    Ok((rewritten.source, warnings))
+}
+
 /// A define of an existing user name updates it (see redefine.rs).
 fn prepare_source(engine: &Engine, state: &BindingState, code: &str) -> redefine::Rewritten {
     match state.builtin_names.read() {
@@ -936,6 +972,78 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn use_loads_a_toolkit_and_reloading_it_updates_callers() {
+        let directory = tempfile::tempdir().expect("library directory");
+        let toolkit = directory.path().join("kit.scm");
+        std::fs::write(
+            &toolkit,
+            "(define (scale) 2)\n(define (grow x) (* x (scale)))",
+        )
+        .expect("write toolkit");
+        let library: &'static std::path::Path =
+            Box::leak(directory.path().to_path_buf().into_boxed_path());
+        let worker = SchemeWorker::spawn(
+            Arc::new(DelayedBridge {
+                started: Arc::new(tokio::sync::Notify::new()),
+            }),
+            OperatorCatalog {
+                protocol_version: blender_mcp_protocol::PROTOCOL_VERSION,
+                revision: "test".to_owned(),
+                blender_version: "test".to_owned(),
+                operators: vec![],
+            },
+            tokio::runtime::Handle::current(),
+            SchemeSettings {
+                default_timeout: Duration::from_secs(5),
+                maximum_timeout: Duration::from_secs(10),
+                library: Some(library),
+            },
+        )
+        .await
+        .expect("worker starts");
+        let handle = worker.handle();
+        let run = |code: &str| {
+            let handle = handle.clone();
+            let code = code.to_owned();
+            async move {
+                handle
+                    .evaluate(code, None, false, false, CancellationToken::new())
+                    .await
+            }
+        };
+        let loaded = run(r#"(use "kit") (define (twice x) (grow (grow x)))"#)
+            .await
+            .expect("loads");
+        assert_eq!(
+            loaded.result,
+            serde_json::json!(["loaded kit (2 forms)", null])
+        );
+        assert_eq!(
+            run("(twice 3)").await.expect("runs").result,
+            serde_json::json!(12)
+        );
+
+        // Editing the toolkit and loading it again reaches twice, defined earlier.
+        std::fs::write(
+            &toolkit,
+            "(define (scale) 10)\n(define (grow x) (* x (scale)))",
+        )
+        .expect("rewrite toolkit");
+        run(r#"(use "kit")"#).await.expect("reloads");
+        assert_eq!(
+            run("(twice 3)").await.expect("runs").result,
+            serde_json::json!(300)
+        );
+
+        let missing = run(r#"(use "nope")"#).await.expect_err("missing");
+        assert_eq!(missing.code, "library_error");
+        assert!(missing.message.contains("available: kit"), "{missing:?}");
+        std::fs::write(directory.path().join("bad.scm"), "(require \"x\")").expect("write bad");
+        let rejected = run(r#"(use "bad")"#).await.expect_err("sandbox");
+        assert_eq!(rejected.code, "sandbox_violation");
+    }
+
+    #[tokio::test]
     async fn expired_queued_source_never_runs_later_and_unicode_reply_preserves_globals() {
         let started = Arc::new(tokio::sync::Notify::new());
         let worker = SchemeWorker::spawn(
@@ -952,6 +1060,7 @@ mod tests {
             SchemeSettings {
                 default_timeout: Duration::from_secs(2),
                 maximum_timeout: Duration::from_secs(3),
+                library: None,
             },
         )
         .await

@@ -74,6 +74,10 @@ struct Cli {
     #[arg(long, env = "BLENDER_MCP_SESSIONS_FILE")]
     sessions_file: Option<PathBuf>,
 
+    /// Read-only directory of `.scm` files that `(use "name")` loads into a session.
+    #[arg(long, env = "BLENDER_MCP_SCHEME_LIBRARY")]
+    scheme_library: Option<PathBuf>,
+
     /// Evaluation budget applied when `scheme_eval` omits `timeout_secs`.
     #[arg(long, default_value_t = 120, value_parser = clap::value_parser!(u64).range(1..))]
     default_timeout_secs: u64,
@@ -359,6 +363,7 @@ async fn start_session(
             SchemeSettings {
                 default_timeout: Duration::from_secs(cli.default_timeout_secs),
                 maximum_timeout: Duration::from_secs(cli.maximum_timeout_secs),
+                library: scheme_library(cli),
             },
         )
         .await
@@ -585,6 +590,13 @@ fn initialize_tracing() {
         .with_env_filter(filter)
         .with_writer(std::io::stderr)
         .init();
+}
+
+/// The library path lives for the whole process; leaking it keeps settings `Copy`.
+fn scheme_library(cli: &Cli) -> Option<&'static std::path::Path> {
+    cli.scheme_library
+        .clone()
+        .map(|path| &*Box::leak(path.into_boxed_path()))
 }
 
 #[cfg(test)]

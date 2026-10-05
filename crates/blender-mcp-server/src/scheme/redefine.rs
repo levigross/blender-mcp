@@ -15,28 +15,31 @@ pub(super) struct Rewritten {
     pub warnings: Vec<String>,
 }
 
-struct Lexeme {
-    kind: Kind,
-    text: String,
-    start: usize,
-    end: usize,
+pub(super) struct Lexeme {
+    pub kind: Kind,
+    pub text: String,
+    pub start: usize,
+    pub end: usize,
 }
 
 #[derive(Clone, Copy, PartialEq, Eq)]
-enum Kind {
+pub(super) enum Kind {
     Open,
     /// `#(` and `#u8(`: vector and byte literals open a form that is data.
     Literal,
     Close,
     /// The `define` keyword, which Steel lexes as its own token.
     Define,
+    DefineSyntax,
+    /// A string literal; `text` holds its value.
+    Str,
     Identifier,
     /// Quote, quasiquote, syntax quotes and datum comments: the next form is data.
     Prefix,
     Other,
 }
 
-fn lex(source: &str) -> Option<Vec<Lexeme>> {
+pub(super) fn lex(source: &str) -> Option<Vec<Lexeme>> {
     TokenStream::new(source, true, None)
         .map(|token| {
             let token = token.ok()?;
@@ -45,17 +48,23 @@ fn lex(source: &str) -> Option<Vec<Lexeme>> {
                 TokenType::OpenParen(_, Some(_)) => Kind::Literal,
                 TokenType::CloseParen(_) => Kind::Close,
                 TokenType::Define => Kind::Define,
+                TokenType::DefineSyntax => Kind::DefineSyntax,
                 TokenType::Identifier(_) => Kind::Identifier,
                 TokenType::QuoteTick
                 | TokenType::QuasiQuote
                 | TokenType::QuoteSyntax
                 | TokenType::QuasiQuoteSyntax
                 | TokenType::DatumComment => Kind::Prefix,
+                TokenType::StringLiteral(_) => Kind::Str,
                 _ => Kind::Other,
+            };
+            let text = match &token.ty {
+                TokenType::StringLiteral(value) => value.resolve().to_owned(),
+                _ => token.source.to_owned(),
             };
             Some(Lexeme {
                 kind,
-                text: token.source.to_owned(),
+                text,
                 start: token.span.start as usize,
                 end: token.span.end as usize,
             })
@@ -129,7 +138,7 @@ pub(super) fn rewrite(
     }
 }
 
-fn matching_close(lexemes: &[Lexeme], open: usize) -> Option<usize> {
+pub(super) fn matching_close(lexemes: &[Lexeme], open: usize) -> Option<usize> {
     let mut depth = 0_usize;
     for (offset, lexeme) in lexemes[open..].iter().enumerate() {
         match lexeme.kind {

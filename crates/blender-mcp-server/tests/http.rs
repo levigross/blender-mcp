@@ -88,6 +88,7 @@ impl Harness {
             SchemeSettings {
                 default_timeout: Duration::from_secs(5),
                 maximum_timeout: Duration::from_secs(30),
+                library: None,
             },
         )
         .await

@@ -64,6 +64,7 @@ async fn worker() -> SchemeWorker {
         SchemeSettings {
             default_timeout: Duration::from_secs(5),
             maximum_timeout: Duration::from_secs(10),
+            library: None,
         },
     )
     .await

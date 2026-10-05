@@ -147,6 +147,7 @@ impl TestServer {
                     SchemeSettings {
                         default_timeout: Duration::from_secs(10),
                         maximum_timeout: Duration::from_secs(30),
+                        library: None,
                     },
                 )
                 .await

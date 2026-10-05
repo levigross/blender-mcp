@@ -442,6 +442,7 @@ mod tests {
             SchemeSettings {
                 default_timeout: Duration::from_secs(2),
                 maximum_timeout: Duration::from_secs(10),
+                library: None,
             },
         )
         .await

@@ -1,4 +1,5 @@
 mod bindings;
+mod library;
 mod marshal;
 mod math;
 mod redefine;
