@@ -17,7 +17,7 @@ use crate::{
     catalog::{build_catalog, describe_operator, property_descriptor},
     errors::{operation_error, operation_error_with_data},
     marshal::{json_to_py, py_to_json},
-    refs::ReferenceStore,
+    refs::{ReferenceStore, pointer},
     scene,
 };
 
@@ -248,6 +248,7 @@ impl BlenderOperations {
             "batch" => self.batch(python, request),
             "checkpoint" => self.checkpoint(python, request),
             "mesh_from_data" => self.mesh_from_data(python, request),
+            "node_tree_build" => self.node_tree_build(python, request),
             "collection_read" | "collection_write" => {
                 self.collection_values(python, operation, request)
             }
@@ -953,6 +954,121 @@ impl BlenderOperations {
         )
     }
 
+    /// Build or update a node tree from a declarative spec in one bridge request:
+    /// interface sockets, nodes (upserted by name: properties, then input defaults),
+    /// then links. On failure, nodes this call created are removed again.
+    fn node_tree_build(&mut self, python: Python<'_>, request: &Value) -> PyResult<Value> {
+        let reference = request.get("tree").cloned().unwrap_or(Value::Null);
+        let tree = self.references.resolve(python, &reference)?;
+        if !is_blender_instance(&tree, "NodeTree") {
+            return Err(operation_error(
+                python,
+                "invalid_arguments",
+                "node-tree! needs a node tree (a material's, world's or node group's)",
+            ));
+        }
+        let nodes = tree.getattr("nodes")?;
+        if request
+            .get("clear")
+            .and_then(Value::as_bool)
+            .unwrap_or(false)
+        {
+            let pointers: Vec<u64> = nodes
+                .try_iter()?
+                .filter_map(|node| node.ok().and_then(|node| pointer(&node)))
+                .collect();
+            nodes.call_method0("clear")?;
+            self.references.retire_pointers(&pointers);
+        }
+        for item in request
+            .get("interface")
+            .and_then(Value::as_array)
+            .map_or(&[][..], Vec::as_slice)
+        {
+            ensure_interface_socket(python, &tree, item)?;
+        }
+        let mut created: Vec<Bound<'_, PyAny>> = Vec::new();
+        let result = (|| -> PyResult<(usize, usize)> {
+            let mut updated = 0;
+            for (index, spec) in array_field(python, request, "nodes")?.iter().enumerate() {
+                // Record a new node before configuring it, so a failure removes it too.
+                let (node, fresh) = place_node(python, &nodes, spec, index)
+                    .map_err(|error| node_error(python, spec, &error))?;
+                if fresh {
+                    created.push(node.clone());
+                } else {
+                    updated += 1;
+                }
+                self.configure_node(python, &node, spec)
+                    .map_err(|error| node_error(python, spec, &error))?;
+            }
+            let links = request
+                .get("links")
+                .and_then(Value::as_array)
+                .map_or(&[][..], Vec::as_slice);
+            for (index, link) in links.iter().enumerate() {
+                link_sockets(python, &tree, link).map_err(|error| {
+                    operation_error(
+                        python,
+                        "invalid_arguments",
+                        format!("link {index} {link}: {}", error.value(python)),
+                    )
+                })?;
+            }
+            Ok((updated, links.len()))
+        })();
+        match result {
+            Ok((updated, links)) => Ok(json!({
+                "created": created.len(),
+                "updated": updated,
+                "links": links,
+                "nodes": nodes.len()?,
+            })),
+            Err(error) => {
+                let pointers: Vec<u64> = created.iter().filter_map(pointer).collect();
+                for node in &created {
+                    let _ = nodes.call_method1("remove", (node,));
+                }
+                self.references.retire_pointers(&pointers);
+                Err(error)
+            }
+        }
+    }
+
+    /// Apply `spec`'s location, label, properties and input defaults to `node`.
+    fn configure_node(
+        &self,
+        python: Python<'_>,
+        node: &Bound<'_, PyAny>,
+        spec: &Value,
+    ) -> PyResult<()> {
+        for key in ["location", "label"] {
+            if let Some(value) = spec.get(key) {
+                node.setattr(key, self.deserialize(python, value)?)?;
+            }
+        }
+        // Properties first: data types and operations decide which sockets exist.
+        if let Some(Value::Object(properties)) = spec.get("properties") {
+            for (key, value) in properties {
+                let key = Self::public_name(python, key, "property")?;
+                let value = self.deserialize(python, value)?;
+                let value = if value.is_instance_of::<PyList>()
+                    && rna_property(node, key).is_some_and(|p| is_flag_enum(&p))
+                {
+                    PySet::new(python, value.try_iter()?.collect::<PyResult<Vec<_>>>()?)?.into_any()
+                } else {
+                    value
+                };
+                node.setattr(key, value)?;
+            }
+        }
+        for (key, value) in socket_pairs(spec.get("inputs")) {
+            let socket = resolve_socket(python, &node.getattr("inputs")?, &key)?;
+            socket.setattr("default_value", self.deserialize(python, &value)?)?;
+        }
+        Ok(())
+    }
+
     /// Paged bulk access to one attribute of every member of a collection (vertex
     /// `co`, attribute `value`, UV `uv`, keyframe `co`, ...). Blender's
     /// `foreach_get`/`foreach_set` always cover the whole collection, so a page reads
@@ -1464,6 +1580,220 @@ fn custom_property_key<'a>(python: Python<'_>, key: &'a str) -> PyResult<&'a str
         ));
     }
     Ok(key)
+}
+
+/// The node named in `spec`: found (and type-checked) or created; `true` if created.
+fn place_node<'py>(
+    python: Python<'py>,
+    nodes: &Bound<'py, PyAny>,
+    spec: &Value,
+    index: usize,
+) -> PyResult<(Bound<'py, PyAny>, bool)> {
+    let name = string_field(spec, "name");
+    let kind = string_field(spec, "type");
+    if name.is_empty() || kind.is_empty() {
+        return Err(operation_error(
+            python,
+            "invalid_arguments",
+            "every node needs a name and a type",
+        ));
+    }
+    let existing = nodes.call_method1("get", (name,))?;
+    if !existing.is_none() {
+        let existing_kind = existing.getattr("bl_idname")?.extract::<String>()?;
+        if existing_kind != kind {
+            return Err(operation_error(
+                python,
+                "invalid_arguments",
+                format!("a node named {name} already exists with type {existing_kind}"),
+            ));
+        }
+        return Ok((existing, false));
+    }
+    let node = nodes.call_method1("new", (kind,))?;
+    node.setattr("name", name)?;
+    let column = f64::from(u32::try_from(index % 14).unwrap_or(0));
+    let row = f64::from(u32::try_from(index / 14).unwrap_or(0));
+    node.setattr("location", (-220.0 * column, -180.0 * row))?;
+    Ok((node, true))
+}
+
+/// `inputs` as (socket key, value) pairs, from `{"Name": v}` or `[[key, v], ...]`;
+/// the pair form allows integer indices.
+fn socket_pairs(inputs: Option<&Value>) -> Vec<(Value, Value)> {
+    match inputs {
+        Some(Value::Object(map)) => map
+            .iter()
+            .map(|(key, value)| (Value::String(key.clone()), value.clone()))
+            .collect(),
+        Some(Value::Array(pairs)) => pairs
+            .iter()
+            .filter_map(|pair| match pair.as_array().map(Vec::as_slice) {
+                Some([key, value]) => Some((key.clone(), value.clone())),
+                _ => None,
+            })
+            .collect(),
+        _ => Vec::new(),
+    }
+}
+
+/// Find a socket by Blender index, by name among the sockets the node's current
+/// settings enable, or by exact identifier. Names repeat (Math has three "Value"
+/// inputs; Mix keeps disabled float, vector and colour variants), and a repeated
+/// name is an error listing indices and identifiers -- even when one socket's
+/// identifier happens to equal the name, since picking it silently is a trap.
+fn resolve_socket<'py>(
+    python: Python<'py>,
+    sockets: &Bound<'py, PyAny>,
+    key: &Value,
+) -> PyResult<Bound<'py, PyAny>> {
+    let all: Vec<Bound<'py, PyAny>> = sockets.try_iter()?.collect::<PyResult<_>>()?;
+    let enabled = |socket: &Bound<'py, PyAny>| {
+        socket
+            .getattr("enabled")
+            .and_then(|flag| flag.extract::<bool>())
+            .unwrap_or(true)
+    };
+    let label = |(index, socket): (usize, &Bound<'py, PyAny>)| {
+        format!(
+            "{index}: {} ({})",
+            attribute_text(socket, "identifier"),
+            attribute_text(socket, "name")
+        )
+    };
+    let available = || {
+        all.iter()
+            .enumerate()
+            .filter(|(_, socket)| enabled(socket))
+            .map(label)
+            .collect::<Vec<_>>()
+            .join(", ")
+    };
+    if let Some(index) = key.as_u64().and_then(|index| usize::try_from(index).ok()) {
+        return all.get(index).cloned().ok_or_else(|| {
+            operation_error(
+                python,
+                "invalid_arguments",
+                format!("no socket {index}; available: {}", available()),
+            )
+        });
+    }
+    let name = key.as_str().unwrap_or_default();
+    let named: Vec<(usize, &Bound<'py, PyAny>)> = all
+        .iter()
+        .enumerate()
+        .filter(|(_, socket)| attribute_text(socket, "name") == name && enabled(socket))
+        .collect();
+    match named.as_slice() {
+        [(_, socket)] => return Ok((*socket).clone()),
+        [] => {}
+        _ => {
+            return Err(operation_error(
+                python,
+                "invalid_arguments",
+                format!(
+                    "socket name {key} is ambiguous; use an index or identifier: {}",
+                    named.into_iter().map(label).collect::<Vec<_>>().join(", ")
+                ),
+            ));
+        }
+    }
+    all.iter()
+        .find(|socket| attribute_text(socket, "identifier") == name)
+        .cloned()
+        .ok_or_else(|| {
+            operation_error(
+                python,
+                "invalid_arguments",
+                format!("no enabled socket {key}; available: {}", available()),
+            )
+        })
+}
+
+fn attribute_text(value: &Bound<'_, PyAny>, name: &str) -> String {
+    value
+        .getattr(name)
+        .and_then(|text| text.extract::<String>())
+        .unwrap_or_default()
+}
+
+/// `[from_node, from_socket, to_node, to_socket]`: link an output to an input.
+fn link_sockets(python: Python<'_>, tree: &Bound<'_, PyAny>, link: &Value) -> PyResult<()> {
+    let Some([from, output, to, input]) = link.as_array().map(Vec::as_slice) else {
+        return Err(operation_error(
+            python,
+            "invalid_arguments",
+            "a link is [from_node, from_socket, to_node, to_socket]",
+        ));
+    };
+    let nodes = tree.getattr("nodes")?;
+    let node = |name: &Value| -> PyResult<Bound<'_, PyAny>> {
+        let found = nodes.call_method1("get", (name.as_str().unwrap_or_default(),))?;
+        if found.is_none() {
+            return Err(operation_error(
+                python,
+                "invalid_arguments",
+                format!("no node named {name}"),
+            ));
+        }
+        Ok(found)
+    };
+    let output = resolve_socket(python, &node(from)?.getattr("outputs")?, output)?;
+    let input = resolve_socket(python, &node(to)?.getattr("inputs")?, input)?;
+    tree.getattr("links")?
+        .call_method1("new", (output, input))?;
+    Ok(())
+}
+
+/// Add a group interface socket `{name, in_out, socket_type}` unless it exists.
+fn ensure_interface_socket(
+    python: Python<'_>,
+    tree: &Bound<'_, PyAny>,
+    item: &Value,
+) -> PyResult<()> {
+    let name = string_field(item, "name");
+    let in_out = item
+        .get("in_out")
+        .and_then(Value::as_str)
+        .unwrap_or("INPUT");
+    let socket_type = item
+        .get("socket_type")
+        .and_then(Value::as_str)
+        .unwrap_or("NodeSocketGeometry");
+    let interface = tree.getattr("interface")?;
+    for existing in interface.getattr("items_tree")?.try_iter()? {
+        let existing = existing?;
+        if attribute_text(&existing, "item_type") == "SOCKET"
+            && attribute_text(&existing, "name") == name
+            && attribute_text(&existing, "in_out") == in_out
+        {
+            return Ok(());
+        }
+    }
+    let kwargs = PyDict::new(python);
+    kwargs.set_item("name", name)?;
+    kwargs.set_item("in_out", in_out)?;
+    kwargs.set_item("socket_type", socket_type)?;
+    interface.call_method("new_socket", (), Some(&kwargs))?;
+    Ok(())
+}
+
+/// Prefix an error with the node spec it came from.
+fn node_error(python: Python<'_>, spec: &Value, error: &PyErr) -> PyErr {
+    let code = error
+        .value(python)
+        .getattr("code")
+        .and_then(|code| code.extract::<String>())
+        .unwrap_or_else(|_| "invalid_arguments".to_owned());
+    operation_error(
+        python,
+        &code,
+        format!(
+            "node {}: {}",
+            string_field(spec, "name"),
+            error.value(python)
+        ),
+    )
 }
 
 /// How one collection member's attribute flattens into a `foreach_get` buffer.

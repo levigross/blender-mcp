@@ -154,6 +154,20 @@ pub enum BridgeOperation {
     Checkpoint {
         filepath: String,
     },
+    /// Build or update a node tree in one request: interface sockets, nodes upserted
+    /// by name (`{name, type, location?, label?, properties{}, inputs}`), then links
+    /// (`[from_node, from_socket, to_node, to_socket]`). Nodes and links stay loosely
+    /// typed here; the Blender side validates them against the live node types.
+    NodeTreeBuild {
+        tree: RnaReference,
+        #[serde(default)]
+        clear: bool,
+        #[serde(default)]
+        interface: Vec<Value>,
+        nodes: Vec<Value>,
+        #[serde(default)]
+        links: Vec<Value>,
+    },
     /// A page of a collection attribute through `foreach_get`: elements
     /// `[offset, offset + count)`, flattened (`stride` values per element).
     CollectionRead {
@@ -257,6 +271,7 @@ impl BridgeOperation {
             | Self::Checkpoint { .. }
             | Self::MeshFromData { .. }
             | Self::CollectionWrite { .. }
+            | Self::NodeTreeBuild { .. }
             | Self::IdPropertySet { .. }
             | Self::IdPropertyDelete { .. }
             | Self::Shutdown => true,

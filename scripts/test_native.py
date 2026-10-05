@@ -591,6 +591,73 @@ class NativeRnaTests(unittest.TestCase):
             bpy.data.curves.remove(curve)
             bpy.data.armatures.remove(armature)
 
+    def test_node_tree_build_upserts_resolves_sockets_and_rolls_back(self):
+        group = bpy.data.node_groups.new("MCP built graph", "GeometryNodeTree")
+        try:
+            tree = self.call(self.get(self.data, "node_groups"), "get", group.name)["$rna_ref"]
+            spec = {
+                "interface": [
+                    {"name": "Geometry", "in_out": "INPUT", "socket_type": "NodeSocketGeometry"},
+                    {"name": "Geometry", "in_out": "OUTPUT", "socket_type": "NodeSocketGeometry"},
+                ],
+                "nodes": [
+                    {"name": "In", "type": "NodeGroupInput"},
+                    {"name": "Out", "type": "NodeGroupOutput", "location": [600, 0]},
+                    {"name": "Move", "type": "GeometryNodeSetPosition"},
+                    {"name": "Scale", "type": "ShaderNodeMath", "properties": {"operation": "MULTIPLY"},
+                     "inputs": [[1, 2.5]]},
+                    {"name": "Offset", "type": "ShaderNodeCombineXYZ", "inputs": {"Y": 0.25}},
+                    {"name": "Tint", "type": "ShaderNodeMix", "properties": {"data_type": "RGBA"},
+                     "inputs": {"A": [1.0, 0.0, 0.0, 1.0]}},
+                ],
+                "links": [
+                    ["In", "Geometry", "Move", "Geometry"],
+                    ["Move", "Geometry", "Out", "Geometry"],
+                    ["Scale", "Value", "Offset", "Z"],
+                    ["Offset", "Vector", "Move", "Offset"],
+                ],
+            }
+            result = self.execute("node_tree_build", tree=tree, **spec)
+            self.assertEqual((result["created"], result["updated"], result["links"]), (6, 0, 4))
+            self.assertEqual(group.nodes["Scale"].inputs[1].default_value, 2.5)
+            self.assertEqual(group.nodes["Offset"].inputs["Y"].default_value, 0.25)
+            # "A" resolves to the colour socket the RGBA data type enables, not A_Float.
+            self.assertEqual(tuple(next(s for s in group.nodes["Tint"].inputs if s.identifier == "A_Color").default_value), (1.0, 0.0, 0.0, 1.0))
+            self.assertEqual(tuple(group.nodes["Out"].location), (600.0, 0.0))
+            self.assertEqual(len(group.links), 4)
+
+            # Re-running the spec updates in place.
+            spec["nodes"][3]["inputs"] = [[1, 4.0]]
+            again = self.execute("node_tree_build", tree=tree, **spec)
+            self.assertEqual((again["created"], again["updated"]), (0, 6))
+            self.assertEqual(group.nodes["Scale"].inputs[1].default_value, 4.0)
+            self.assertEqual((len(group.nodes), len(group.links)), (6, 4))
+
+            # Math has three inputs named "Value": the name alone is ambiguous.
+            with self.assertRaises(native.OperationError) as raised:
+                self.execute("node_tree_build", tree=tree, nodes=[
+                    {"name": "Twice", "type": "ShaderNodeMath", "inputs": {"Value": 1.0}}])
+            self.assertIn("ambiguous", str(raised.exception))
+            self.assertIn("Value_001", str(raised.exception))
+            self.assertNotIn("Twice", group.nodes)
+
+            # A failing link removes the nodes this call created; earlier ones stay.
+            with self.assertRaises(native.OperationError) as raised:
+                self.execute("node_tree_build", tree=tree,
+                             nodes=[{"name": "Extra", "type": "ShaderNodeMath"}],
+                             links=[["Extra", "Value", "Nowhere", 0]])
+            self.assertIn("no node named", str(raised.exception))
+            self.assertNotIn("Extra", group.nodes)
+            self.assertEqual(len(group.nodes), 6)
+
+            self.assert_code("invalid_arguments", "node_tree_build", tree=tree,
+                             nodes=[{"name": "Scale", "type": "ShaderNodeVectorMath"}])
+            cleared = self.execute("node_tree_build", tree=tree, clear=True,
+                                   nodes=[{"name": "Only", "type": "ShaderNodeMath"}])
+            self.assertEqual(cleared["nodes"], 1)
+        finally:
+            bpy.data.node_groups.remove(group)
+
     def test_collection_values_page_and_patch_in_place(self):
         count = 3000
         mesh = bpy.data.meshes.new("MCP bulk mesh")

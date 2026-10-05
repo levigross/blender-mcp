@@ -1017,6 +1017,7 @@ mod tests {
                 (define (batch! commands) commands)
                 (define (collection-read collection attribute . page) (hash "total" 0 "stride" 0 "values" '()))
                 (define (collection-write! collection attribute offset values) values)
+                (define (node-tree! tree spec) spec)
                 "#
                 .to_owned(),
             )
@@ -1253,6 +1254,36 @@ mod tests {
         );
         let faces = last_json(&mut engine, "(mesh-faces \"cube\")");
         assert_eq!(faces, serde_json::json!([[0, 1, 2], [3, 4, 5], [6, 7, 8]]));
+    }
+
+    #[test]
+    fn expr_to_nodes_compiles_constants_as_defaults_and_folds_variadic_ops() {
+        let mut engine = stdlib_engine();
+        let graph = last_json(
+            &mut engine,
+            "(expr->nodes '(let ((s (* p 2))) (+ s (sin q) 1)) (list (list 'p (list \"In\" \"X\")) (list 'q 0.5)) \"e\")",
+        );
+        // (* p 2), (sin 0.5), (+ s sin) and (+ _ 1): four Math nodes.
+        let nodes = graph["nodes"].as_array().expect("nodes");
+        assert_eq!(nodes.len(), 4, "{graph}");
+        assert_eq!(nodes[0]["properties"]["operation"], "MULTIPLY");
+        assert_eq!(nodes[0]["inputs"], serde_json::json!([[1, 2]]));
+        assert_eq!(nodes[1]["inputs"], serde_json::json!([[0, 0.5]]));
+        assert_eq!(nodes[3]["inputs"], serde_json::json!([[1, 1]]));
+        assert_eq!(
+            graph["links"],
+            serde_json::json!([
+                ["In", "X", "e1", 0],
+                ["e1", 0, "e3", 0],
+                ["e2", 0, "e3", 1],
+                ["e3", 0, "e4", 0]
+            ])
+        );
+        assert_eq!(graph["output"], serde_json::json!(["e4", 0]));
+        let bad = engine
+            .run("(expr->nodes '(+ nope 1) '() \"e\")".to_owned())
+            .expect_err("unbound");
+        assert!(bad.to_string().contains("unbound name"), "{bad}");
     }
 
     #[test]

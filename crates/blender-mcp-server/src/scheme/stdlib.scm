@@ -54,6 +54,13 @@
 (define (rna-get-command reference attribute)
   (hash "operation" "rna_get" "reference" reference "attribute" attribute))
 
+(define (rna-call-command reference function args kwargs)
+  (hash "operation" "rna_call" "reference" reference "function" function
+        "args" args "kwargs" kwargs))
+
+(define (op-call-command idname kwargs)
+  (hash "operation" "operator_call" "idname" idname "kwargs" kwargs))
+
 ;; Custom properties (obj["key"]) for batch!, e.g. tagging many objects for export.
 (define (prop-set-command reference key value)
   (hash "operation" "id_property_set" "reference" reference "key" key "value" value))
@@ -594,6 +601,122 @@
 (define (make-heightfield name columns rows size height-at . collection)
   (let ([data (heightfield-data columns rows size height-at)])
     (apply mesh-from-data! name (list-ref data 0) (list-ref data 1) collection)))
+
+;; ---------------------------------------------------------------- node graphs
+;;
+;; `node-tree!` (native) builds a whole graph in one bridge call from plain data:
+;;   (node-tree! tree (hash "nodes" (list (node "Scale" "ShaderNodeMath"
+;;                                             "properties" (hash "operation" "MULTIPLY")
+;;                                             "inputs" (list (list 1 2.0))))
+;;                          "links" (list (link "Group Input" "Geometry" "Out" "Geometry"))))
+;; Nodes are upserted by name, so re-running a spec updates the graph in place.
+
+(define (node name type . options) (apply hash "name" name "type" type options))
+(define (link from-node from-socket to-node to-socket)
+  (list from-node from-socket to-node to-socket))
+
+;; Expression -> node-tree! spec. Operators: + - * / min max pow atan2 abs sqrt sin
+;; cos exp floor fract sign, (vec x y z), (x v) (y v) (z v), (map-range v a b c d),
+;; (attr "name") in geometry trees, and (let ((name expr) ...) body). Symbols come
+;; from `env`, an association list of (symbol (node socket)) or (symbol number).
+;; Constants become input defaults rather than nodes. Returns a hash with "nodes",
+;; "links" and "output" (a (node socket) list, or a number for a constant).
+(define expr-math-ops
+  (list (list '+ "ADD") (list '- "SUBTRACT") (list '* "MULTIPLY") (list '/ "DIVIDE")
+        (list 'min "MINIMUM") (list 'max "MAXIMUM") (list 'pow "POWER")
+        (list 'atan2 "ARCTAN2") (list 'abs "ABSOLUTE") (list 'sqrt "SQRT")
+        (list 'sin "SINE") (list 'cos "COSINE") (list 'exp "EXPONENT")
+        (list 'floor "FLOOR") (list 'fract "FRACT") (list 'sign "SIGN")))
+
+(define (expr-lookup key table)
+  (cond [(null? table) #false]
+        [(equal? (car (car table)) key) (car table)]
+        [else (expr-lookup key (cdr table))]))
+
+(define (expr->nodes expr env prefix)
+  (let ([nodes '()] [links '()] [count 0])
+    (define (add-node! type properties)
+      (set! count (+ count 1))
+      (let ([name (string-append prefix (number->string count))])
+        (set! nodes (cons (list name type properties '()) nodes))
+        name))
+    ;; Constants become input defaults; sockets become links.
+    (define (feed! name key value)
+      (if (number? value)
+          (set! nodes (map (lambda (entry)
+                             (if (equal? (car entry) name)
+                                 (list (list-ref entry 0) (list-ref entry 1) (list-ref entry 2)
+                                       (cons (list key value) (list-ref entry 3)))
+                                 entry))
+                           nodes))
+          (set! links (cons (list (car value) (list-ref value 1) name key) links))))
+    (define (node-with! type properties keys values output)
+      (let ([name (add-node! type properties)])
+        (map (lambda (key value) (feed! name key value)) keys values)
+        (list name output)))
+    (define (math op args)
+      (node-with! "ShaderNodeMath" (hash "operation" op) (range 0 (length args)) args 0))
+    (define (compile e scope)
+      (cond
+        [(number? e) e]
+        [(symbol? e)
+         (let ([found (expr-lookup e scope)])
+           (if found (list-ref found 1) (error "expr->nodes: unbound name" e)))]
+        [(not (pair? e)) (error "expr->nodes: cannot compile" e)]
+        [(equal? (car e) 'let)
+         (let ([extended (append (map (lambda (binding)
+                                        (list (car binding) (compile (list-ref binding 1) scope)))
+                                      (list-ref e 1))
+                                 scope)])
+           (compile (list-ref e 2) extended))]
+        ;; (+ a b c) folds to (+ (+ a b) c) before anything is compiled.
+        [(and (expr-lookup (car e) expr-math-ops) (> (length (cdr e)) 2))
+         (compile (cons (car e) (cons (list (car e) (list-ref e 1) (list-ref e 2))
+                                      (cdr (cdr (cdr e)))))
+                  scope)]
+        [else
+         (let ([args (map (lambda (arg) (compile arg scope)) (cdr e))]
+               [op (car e)])
+           (cond
+             [(and (equal? op '-) (= (length args) 1)) (math "MULTIPLY" (list (car args) -1.0))]
+             [(expr-lookup op expr-math-ops)
+              (math (list-ref (expr-lookup op expr-math-ops) 1) args)]
+             [(equal? op 'vec) (node-with! "ShaderNodeCombineXYZ" (hash) (list 0 1 2) args 0)]
+             [(equal? op 'x) (node-with! "ShaderNodeSeparateXYZ" (hash) (list 0) args 0)]
+             [(equal? op 'y) (node-with! "ShaderNodeSeparateXYZ" (hash) (list 0) args 1)]
+             [(equal? op 'z) (node-with! "ShaderNodeSeparateXYZ" (hash) (list 0) args 2)]
+             [(equal? op 'map-range)
+              (node-with! "ShaderNodeMapRange" (hash)
+                          (list "Value" "From Min" "From Max" "To Min" "To Max") args 0)]
+             [(equal? op 'attr)
+              (let ([name (add-node! "GeometryNodeInputNamedAttribute" (hash "data_type" "FLOAT"))])
+                (set! nodes (map (lambda (entry)
+                                   (if (equal? (car entry) name)
+                                       (list name (list-ref entry 1) (list-ref entry 2)
+                                             (list (list "Name" (list-ref (cdr e) 0))))
+                                       entry))
+                                 nodes))
+                (list name 0))]
+             [else (error "expr->nodes: unknown operator" op)]))]))
+    (let ([output (compile expr env)])
+      (hash "nodes" (map (lambda (entry)
+                           (hash "name" (list-ref entry 0) "type" (list-ref entry 1)
+                                 "properties" (list-ref entry 2) "inputs" (reverse (list-ref entry 3))))
+                         (reverse nodes))
+            "links" (reverse links)
+            "output" output))))
+
+;; Compile `expr` into `tree` and wire its result into `to-node`'s `to-socket`.
+(define (expr-into! tree expr env prefix to-node to-socket)
+  (let ([graph (expr->nodes expr env prefix)])
+    (node-tree! tree
+                (hash "nodes" (hash-ref graph "nodes")
+                      "links" (if (number? (hash-ref graph "output"))
+                                  (hash-ref graph "links")
+                                  (append (hash-ref graph "links")
+                                          (list (append (hash-ref graph "output")
+                                                        (list to-node to-socket)))))))
+    graph))
 
 ;; ------------------------------------------------------------------ bulk data
 ;;

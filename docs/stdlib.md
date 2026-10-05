@@ -121,6 +121,49 @@ trigger.
 (node-remove! tree node)
 ```
 
+These make one bridge call per step. For anything larger, describe the whole graph
+as data and build it in **one** call with `node-tree!`:
+
+```scheme
+(node-tree! tree
+  (hash "interface" (list (hash "name" "Geometry" "in_out" "INPUT"  "socket_type" "NodeSocketGeometry")
+                          (hash "name" "Geometry" "in_out" "OUTPUT" "socket_type" "NodeSocketGeometry"))
+        "nodes" (list (node "In" "NodeGroupInput")
+                      (node "Out" "NodeGroupOutput" "location" (list 600 0))
+                      (node "Move" "GeometryNodeSetPosition")
+                      (node "Lift" "ShaderNodeCombineXYZ" "inputs" (hash "Z" 0.25)))
+        "links" (list (link "In" "Geometry" "Move" "Geometry")
+                      (link "Lift" "Vector" "Move" "Offset")
+                      (link "Move" "Geometry" "Out" "Geometry"))))
+```
+
+- Nodes are **upserted by name**: re-running a spec updates nodes in place, so a graph
+  can be refined by editing the spec. `"clear" #true` empties the tree first.
+- `"properties"` are set before `"inputs"`, because a data type or operation decides
+  which sockets exist.
+- Sockets are named by Blender index, by name among the sockets the node currently
+  enables, or by identifier (`"Value_001"`, `"A_Color"`). A name shared by several
+  sockets, such as Math's two `"Value"` inputs, is an error listing the indices and
+  identifiers to use. `"inputs"` takes a hash, or `(list (list key value) ...)` when a
+  key is an index.
+- If any node or link fails, the nodes this call created are removed again and the
+  error names the failing item.
+
+`expr->nodes` compiles arithmetic into such a spec. Constants become input defaults,
+and `(+ a b c)` chains:
+
+```scheme
+(define graph (expr->nodes '(let ((s (* (z p) 0.5))) (vec 0 0 (+ s (sin (x p)))))
+                           (list (list 'p (list "Position" "Position")))
+                           "lift-"))
+(node-tree! tree (hash "nodes" (hash-ref graph "nodes") "links" (hash-ref graph "links")))
+(hash-ref graph "output")                  ; ("lift-6" 0): link it where it belongs
+(expr-into! tree '(* (x p) 2) env "k-" "Move" "Offset")   ; build and wire in one go
+```
+
+Operators: `+ - * / min max pow atan2 abs sqrt sin cos exp floor fract sign`, `vec`,
+`x`/`y`/`z`, `map-range`, `attr` (geometry trees), and `let`.
+
 ## Modifiers
 
 ```scheme
@@ -298,7 +341,8 @@ pieces, and read or rewrite existing ones in pages:
 A page holds at most 4,096 values. `foreach_get` through `rna-call` also returns the
 buffer it filled, for collections small enough to read in one call.
 
-`rna-set-command` and `rna-get-command` create typed command hashes for `batch!`:
+`rna-set-command`, `rna-get-command`, `rna-call-command`, `op-call-command` and
+`prop-set-command` create typed command hashes for `batch!`:
 
 ```scheme
 (batch! (list (rna-set-command object "location" (list 1 2 3))

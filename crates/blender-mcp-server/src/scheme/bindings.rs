@@ -291,6 +291,30 @@ fn register_bulk_functions(
 
     let invoke = Invocation::new(bridge, runtime, deadline, state);
     engine.register_fn(
+        "node-tree!",
+        move |tree: SteelVal, spec: SteelVal| -> Result<SteelVal, SteelErr> {
+            let Value::Object(spec) = steel_to_json(&spec)? else {
+                return Err(steel_error(
+                    "node-tree! expects a hash with \"nodes\" and optional \"links\", \"interface\" and \"clear\"",
+                ));
+            };
+            let list = |key: &str| match spec.get(key) {
+                None | Some(Value::Null) => Ok(Vec::new()),
+                Some(Value::Array(items)) => Ok(items.clone()),
+                Some(_) => Err(steel_error(format!("node-tree! {key} must be a list"))),
+            };
+            invoke.call(BridgeOperation::NodeTreeBuild {
+                tree: parse_reference(&tree)?,
+                clear: spec.get("clear").and_then(Value::as_bool).unwrap_or(false),
+                interface: list("interface")?,
+                nodes: list("nodes")?,
+                links: list("links")?,
+            })
+        },
+    );
+
+    let invoke = Invocation::new(bridge, runtime, deadline, state);
+    engine.register_fn(
         "collection-write!",
         move |reference: SteelVal,
               attribute: String,

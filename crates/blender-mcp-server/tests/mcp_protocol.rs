@@ -84,6 +84,13 @@ impl BlenderBridge for MockBridge {
                 ..
             } => json!({"name": name, "vertices": vertices, "faces": faces,
                         "collection": collection.map(|reference| reference.id)}),
+            BridgeOperation::NodeTreeBuild {
+                clear,
+                interface,
+                nodes,
+                links,
+                ..
+            } => json!({"clear": clear, "interface": interface, "nodes": nodes, "links": links}),
             BridgeOperation::CollectionRead {
                 attribute,
                 offset,
@@ -590,6 +597,23 @@ async fn build_bindings_send_typed_payloads_and_reject_malformed_geometry() {
         let rejected = evaluate(&server, malformed).await;
         assert_eq!(rejected.is_error, Some(true), "{malformed} should fail");
     }
+
+    let graph = evaluate(
+        &server,
+        r#"(node-tree! (context-ref)
+             (hash "clear" #true
+                   "nodes" (list (node "Scale" "ShaderNodeMath" "inputs" (list (list 1 2.5))))
+                   "links" (list (link "In" "Geometry" "Scale" 0))))"#,
+    )
+    .await;
+    assert_eq!(
+        structured(&graph)["result"],
+        json!({"clear": true, "interface": [],
+               "nodes": [{"name": "Scale", "type": "ShaderNodeMath", "inputs": [[1, 2.5]]}],
+               "links": [["In", "Geometry", "Scale", 0]]})
+    );
+    let malformed = evaluate(&server, r"(node-tree! (context-ref) (list 1 2))").await;
+    assert_eq!(malformed.is_error, Some(true));
 
     let read = evaluate(&server, r#"(collection-read (context-ref) "co" 10 5)"#).await;
     assert_eq!(

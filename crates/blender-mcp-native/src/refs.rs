@@ -495,7 +495,7 @@ impl ReferenceStore {
     }
 }
 
-fn pointer(value: &Bound<'_, PyAny>) -> Option<u64> {
+pub(crate) fn pointer(value: &Bound<'_, PyAny>) -> Option<u64> {
     value
         .call_method0("as_pointer")
         .and_then(|v| v.extract::<u64>())
