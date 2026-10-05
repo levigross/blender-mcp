@@ -54,7 +54,7 @@ pub(crate) struct BlenderOperations {
 #[pymethods]
 impl BlenderOperations {
     #[new]
-    #[pyo3(signature = (*, reference_capacity=4096, artifact_ttl_secs=3600))]
+    #[pyo3(signature = (*, reference_capacity=65_536, artifact_ttl_secs=3600))]
     fn new(
         python: Python<'_>,
         reference_capacity: usize,

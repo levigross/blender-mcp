@@ -99,13 +99,29 @@ class NativeRnaTests(unittest.TestCase):
             another.close()
 
     def test_reference_capacity_and_removed_or_renamed_owners(self):
-        limited = native.BlenderOperations(reference_capacity=1)
+        # A full store evicts its least recently used handle rather than refusing new
+        # work; the evicted handle then reports stale_reference, like any other.
+        limited = native.BlenderOperations(reference_capacity=2)
         try:
-            limited.execute({"operation": "data_ref"})
+            data = limited.execute({"operation": "data_ref"})[0]
+            context = limited.execute({"operation": "context_ref"})[0]
+            limited.execute({"operation": "rna_get", "reference": context["$rna_ref"], "attribute": "scene"})
             with self.assertRaises(native.OperationError) as raised:
-                limited.execute({"operation": "context_ref"})
+                limited.execute({"operation": "rna_get", "reference": data["$rna_ref"], "attribute": "objects"})
+            self.assertEqual(raised.exception.code, "stale_reference")
+            self.assertIn("evicted", str(raised.exception))
+            # One result that alone needs more handles than the store holds still fails,
+            # rather than evicting its own handles before they are returned.
+            objects = limited.execute({"operation": "rna_get", "reference": limited.execute({"operation": "data_ref"})[0]["$rna_ref"], "attribute": "objects"})[0]
+            bpy.data.objects.new("MCP capacity a", None)
+            bpy.data.objects.new("MCP capacity b", None)
+            with self.assertRaises(native.OperationError) as raised:
+                limited.execute({"operation": "rna_items", "reference": objects["$rna_ref"], "limit": 3})
             self.assertEqual(raised.exception.code, "reference_limit")
         finally:
+            for name in ("MCP capacity a", "MCP capacity b"):
+                if name in bpy.data.objects:
+                    bpy.data.objects.remove(bpy.data.objects[name])
             limited.close()
         objects = self.get(self.data, "objects")
         obj = self.call(objects, "new", "MCP reference test", None)

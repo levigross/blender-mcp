@@ -1,7 +1,13 @@
 //! Epoch-scoped handles. RNA owners and traversal paths are resolved afresh so
 //! removing an object never leaves a cached Rust handle dereferencing freed RNA.
 
-use std::{collections::HashMap, sync::Arc};
+use std::{
+    collections::HashMap,
+    sync::{
+        Arc,
+        atomic::{AtomicU64, Ordering},
+    },
+};
 
 use pyo3::prelude::*;
 use serde_json::{Value, json};
@@ -50,6 +56,8 @@ struct Entry {
     identity: String,
     type_name: String,
     serial: u64,
+    /// Logical time of the last mint or resolution, for least-recently-used eviction.
+    last_used: AtomicU64,
 }
 
 pub(crate) struct ReferenceStore {
@@ -59,6 +67,11 @@ pub(crate) struct ReferenceStore {
     nonce: String,
     entries: HashMap<String, Entry>,
     identities: HashMap<String, String>,
+    /// Logical clock for `Entry::last_used`.
+    clock: AtomicU64,
+    /// First serial minted by the request in progress; those entries are never evicted,
+    /// so a result cannot lose its own handles before it is returned.
+    request_floor: u64,
 }
 
 impl ReferenceStore {
@@ -71,6 +84,8 @@ impl ReferenceStore {
             nonce: secrets.call_method1("token_hex", (12,))?.extract()?,
             entries: HashMap::new(),
             identities: HashMap::new(),
+            clock: AtomicU64::new(0),
+            request_floor: 1,
         })
     }
 
@@ -78,8 +93,41 @@ impl ReferenceStore {
         self.generation
     }
 
-    pub(crate) const fn mark(&self) -> u64 {
+    /// Start a request: entries minted from here on are protected from eviction and
+    /// are what `rollback` removes if the request fails.
+    pub(crate) fn mark(&mut self) -> u64 {
+        self.request_floor = self.next_id;
         self.next_id
+    }
+
+    fn touch(&self, entry: &Entry) {
+        // Only Blender's main thread dispatches; atomics just satisfy `Sync`.
+        let now = self.clock.fetch_add(1, Ordering::Relaxed) + 1;
+        entry.last_used.store(now, Ordering::Relaxed);
+    }
+
+    /// Make room by retiring the least recently used eighth of the store, never
+    /// touching entries minted by the request in progress. Eviction is safe: every
+    /// handle is re-found from its live owner on use, so an evicted one can only
+    /// report `stale_reference`, never reach freed memory.
+    fn evict(&mut self) -> bool {
+        let mut candidates: Vec<(u64, String)> = self
+            .entries
+            .iter()
+            .filter(|(_, entry)| entry.serial < self.request_floor)
+            .map(|(id, entry)| (entry.last_used.load(Ordering::Relaxed), id.clone()))
+            .collect();
+        if candidates.is_empty() {
+            return false;
+        }
+        let count = (self.capacity / 8).clamp(1, candidates.len());
+        candidates.select_nth_unstable(count - 1);
+        for (_, id) in &candidates[..count] {
+            if let Some(entry) = self.entries.remove(id) {
+                self.identities.remove(&entry.identity);
+            }
+        }
+        true
     }
     pub(crate) fn rollback(&mut self, mark: u64) {
         self.entries.retain(|_, entry| entry.serial < mark);
@@ -301,16 +349,17 @@ impl ReferenceStore {
             if let Some(entry) = self.entries.get(&id)
                 && resolve_locator(value.py(), &entry.locator, 0).is_ok()
             {
+                self.touch(entry);
                 return Ok(self.envelope(&id, &type_name));
             }
             self.entries.remove(&id);
             self.identities.remove(&identity);
         }
-        if self.entries.len() >= self.capacity {
+        if self.entries.len() >= self.capacity && !self.evict() {
             return Err(operation_error(
                 value.py(),
                 "reference_limit",
-                "reference capacity reached; release handles or reset the session",
+                "this single result needs more handles than the reference capacity; request a smaller page",
             ));
         }
         let id = format!("{}-{}", self.nonce, self.next_id);
@@ -324,8 +373,12 @@ impl ReferenceStore {
                 identity,
                 type_name: type_name.clone(),
                 serial,
+                last_used: AtomicU64::new(0),
             },
         );
+        if let Some(entry) = self.entries.get(&id) {
+            self.touch(entry);
+        }
         Ok(self.envelope(&id, &type_name))
     }
 
@@ -348,8 +401,13 @@ impl ReferenceStore {
         self.check_generation(python, reference)?;
         self.entries
             .get(reference.get("id").and_then(Value::as_str).unwrap_or(""))
+            .inspect(|entry| self.touch(entry))
             .ok_or_else(|| {
-                operation_error(python, "stale_reference", "unknown or released RNA handle")
+                operation_error(
+                    python,
+                    "stale_reference",
+                    "unknown, released, or evicted RNA handle; fetch it again",
+                )
             })
     }
 

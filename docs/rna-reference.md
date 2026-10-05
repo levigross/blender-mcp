@@ -16,11 +16,17 @@ when the replacement document reuses the same object names. Saving a checkpoint
 copy does not change that epoch. `reference-stats` reports retained handles;
 `reference-release!` releases handles the caller no longer needs.
 
-Physical subdata handles, such as mesh vertices or node sockets, are invalidated
-conservatively after geometry or shading updates. Delayed Blender callbacks can
-also invalidate handles after native operations; reacquire them when needed. ID
-references, rooted collections, and modifiers survive these updates. Modifier
-references resolve through the owning object's session identity and Blender's
+The bridge retains up to 65,536 handles. When it is full it evicts the least
+recently used eighth, never handles from the request in progress; using an evicted
+handle returns `stale_reference`, so fetch it again. Only a single result that alone
+needs more handles than that fails, with `reference_limit`.
+
+Array-backed subdata handles, such as mesh vertices or layers, are invalidated
+conservatively after geometry or shading updates. Node-tree data -- nodes, sockets,
+links, and interface items -- is allocated item by item and survives them. Delayed
+Blender callbacks can also invalidate handles after native operations; reacquire
+them when needed. ID references, rooted collections, and modifiers survive these
+updates. Modifier references resolve through the owning object's session identity and Blender's
 [`persistent_uid`](https://docs.blender.org/api/5.2/bpy.types.Modifier.html#bpy.types.Modifier.persistent_uid),
 with a pointer check for replacement. Thus `add-modifier!` results remain usable
 after geometry evaluation and renaming. Destructive collection edits still expire
