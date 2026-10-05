@@ -2,7 +2,7 @@
 //! removing an object never leaves a cached Rust handle dereferencing freed RNA.
 
 use std::{
-    collections::HashMap,
+    collections::{HashMap, HashSet, VecDeque},
     sync::{
         Arc,
         atomic::{AtomicU64, Ordering},
@@ -72,7 +72,13 @@ pub(crate) struct ReferenceStore {
     /// First serial minted by the request in progress; those entries are never evicted,
     /// so a result cannot lose its own handles before it is returned.
     request_floor: u64,
+    /// Why recently retired handles were retired, so `stale_reference` can say so.
+    retired: HashMap<String, String>,
+    retired_order: VecDeque<String>,
 }
+
+/// Retirement reasons kept for explaining stale handles.
+const RETIRED_REASONS: usize = 4_096;
 
 impl ReferenceStore {
     pub(crate) fn new(python: Python<'_>, capacity: usize) -> PyResult<Self> {
@@ -86,6 +92,8 @@ impl ReferenceStore {
             identities: HashMap::new(),
             clock: AtomicU64::new(0),
             request_floor: 1,
+            retired: HashMap::new(),
+            retired_order: VecDeque::new(),
         })
     }
 
@@ -106,6 +114,33 @@ impl ReferenceStore {
         entry.last_used.store(now, Ordering::Relaxed);
     }
 
+    /// Remove every entry for which `reason` returns one, remembering why.
+    fn retire_where(&mut self, mut reason: impl FnMut(&str, &Entry) -> Option<String>) -> usize {
+        let doomed: Vec<(String, String)> = self
+            .entries
+            .iter()
+            .filter_map(|(id, entry)| reason(id, entry).map(|why| (id.clone(), why)))
+            .collect();
+        for (id, why) in &doomed {
+            if let Some(entry) = self.entries.remove(id) {
+                self.identities.remove(&entry.identity);
+                self.remember(id, format!("{} handle {why}", entry.type_name));
+            }
+        }
+        doomed.len()
+    }
+
+    fn remember(&mut self, id: &str, why: String) {
+        if self.retired.insert(id.to_owned(), why).is_none() {
+            self.retired_order.push_back(id.to_owned());
+            while self.retired_order.len() > RETIRED_REASONS {
+                if let Some(oldest) = self.retired_order.pop_front() {
+                    self.retired.remove(&oldest);
+                }
+            }
+        }
+    }
+
     /// Make room by retiring the least recently used eighth of the store, never
     /// touching entries minted by the request in progress. Eviction is safe: every
     /// handle is re-found from its live owner on use, so an evicted one can only
@@ -122,52 +157,67 @@ impl ReferenceStore {
         }
         let count = (self.capacity / 8).clamp(1, candidates.len());
         candidates.select_nth_unstable(count - 1);
-        for (_, id) in &candidates[..count] {
-            if let Some(entry) = self.entries.remove(id) {
-                self.identities.remove(&entry.identity);
-            }
-        }
+        let evicted: HashSet<String> = candidates[..count]
+            .iter()
+            .map(|(_, id)| id.clone())
+            .collect();
+        let capacity = self.capacity;
+        self.retire_where(|id, _| {
+            evicted.contains(id).then(|| {
+                format!(
+                    "was evicted: the store holds {capacity} handles and this was among the least recently used"
+                )
+            })
+        });
         true
     }
     pub(crate) fn rollback(&mut self, mark: u64) {
-        self.entries.retain(|_, entry| entry.serial < mark);
-        self.identities
-            .retain(|_, id| self.entries.contains_key(id));
+        self.retire_where(|_, entry| {
+            (entry.serial >= mark).then(|| "was minted by a request that failed".to_owned())
+        });
     }
 
     pub(crate) fn invalidate(&mut self) -> u64 {
         self.entries.clear();
         self.identities.clear();
+        self.retired.clear();
+        self.retired_order.clear();
         self.generation += 1;
         self.generation
     }
 
-    pub(crate) fn invalidate_subdata(&mut self) -> usize {
-        let before = self.entries.len();
-        self.entries
-            .retain(|_, entry| !entry.locator.has_physical_subdata());
-        self.identities
-            .retain(|_, id| self.entries.contains_key(id));
-        before - self.entries.len()
+    /// Retire volatile (array-backed) sub-data handles; `cause` says what may have
+    /// reallocated them.
+    pub(crate) fn invalidate_subdata(&mut self, cause: &str) -> usize {
+        self.retire_where(|_, entry| {
+            entry.locator.has_physical_subdata().then(|| {
+                format!("was retired after {cause}: array-backed data may have been reallocated")
+            })
+        })
     }
 
+    /// Retire handles reached through a collection that `function` is about to change.
+    /// Adding or reordering members moves only array-backed members, so durable
+    /// members (individually allocated) survive those; clearing or popping retires all.
     pub(crate) fn invalidate_collection(
         &mut self,
         python: Python<'_>,
         reference: &Value,
+        function: &str,
     ) -> PyResult<()> {
         let target = self.entry(python, reference)?.locator.clone();
-        self.entries.retain(|_, entry| {
+        let volatile_only = matches!(function, "add" | "insert" | "move");
+        self.retire_where(|_, entry| {
             let shares_owner_path = matches!(
                 &*entry.locator,
                 Locator::Path { .. } | Locator::Modifier { .. }
             ) && entry.locator.owner_uid().is_some()
                 && entry.locator.owner_uid() == target.owner_uid();
-            Arc::ptr_eq(&entry.locator, &target)
-                || !(entry.locator.descends_from(&target) || shares_owner_path)
+            let affected = !Arc::ptr_eq(&entry.locator, &target)
+                && (entry.locator.descends_from(&target) || shares_owner_path)
+                && (!volatile_only || entry.locator.has_physical_subdata());
+            affected.then(|| format!("was retired by `{function}` on its collection"))
         });
-        self.identities
-            .retain(|_, id| self.entries.contains_key(id));
         Ok(())
     }
 
@@ -209,25 +259,25 @@ impl ReferenceStore {
             })
             .map(|entry| entry.locator.clone())
             .collect();
-        self.entries.retain(|_, entry| {
-            !freed.iter().any(|target| {
-                Arc::ptr_eq(&entry.locator, target) || entry.locator.descends_from(target)
-            })
+        self.retire_where(|_, entry| {
+            freed
+                .iter()
+                .any(|target| {
+                    Arc::ptr_eq(&entry.locator, target) || entry.locator.descends_from(target)
+                })
+                .then(|| "was retired: its target was removed".to_owned())
         });
-        self.identities
-            .retain(|_, id| self.entries.contains_key(id));
     }
 
     pub(crate) fn prune_removed_modifiers(&mut self, python: Python<'_>) {
         // Blender can reuse both persistent_uid and memory on new(). Retire
         // missing modifiers before allocation can make an old locator resolve
         // to a replacement, including when deletion happened outside MCP.
-        self.entries.retain(|_, entry| {
-            !matches!(&*entry.locator, Locator::Modifier { .. })
-                || resolve_locator(python, &entry.locator, 0).is_ok()
+        self.retire_where(|_, entry| {
+            (matches!(&*entry.locator, Locator::Modifier { .. })
+                && resolve_locator(python, &entry.locator, 0).is_err())
+            .then(|| "was retired: its modifier was removed".to_owned())
         });
-        self.identities
-            .retain(|_, id| self.entries.contains_key(id));
     }
 
     pub(crate) fn stats(&self) -> Value {
@@ -244,6 +294,7 @@ impl ReferenceStore {
                 && let Some(entry) = self.entries.remove(id)
             {
                 self.identities.remove(&entry.identity);
+                self.remember(id, format!("{} handle was released", entry.type_name));
                 released += 1;
             }
         }
@@ -281,7 +332,7 @@ impl ReferenceStore {
             name: name.to_owned(),
             pointer: pointer(value),
             uid,
-            durable: is_node_tree_data(value),
+            durable: !is_volatile_data(value),
         });
         self.store(value, locator, Some(identity))
     }
@@ -304,7 +355,7 @@ impl ReferenceStore {
             Arc::new(Locator::Member {
                 parent,
                 pointer,
-                durable: is_node_tree_data(value),
+                durable: !is_volatile_data(value),
             }),
             Some(identity),
         )
@@ -352,7 +403,15 @@ impl ReferenceStore {
                 self.touch(entry);
                 return Ok(self.envelope(&id, &type_name));
             }
-            self.entries.remove(&id);
+            if let Some(entry) = self.entries.remove(&id) {
+                self.remember(
+                    &id,
+                    format!(
+                        "{} handle was retired: its target no longer resolves",
+                        entry.type_name
+                    ),
+                );
+            }
             self.identities.remove(&identity);
         }
         if self.entries.len() >= self.capacity && !self.evict() {
@@ -403,11 +462,12 @@ impl ReferenceStore {
             .get(reference.get("id").and_then(Value::as_str).unwrap_or(""))
             .inspect(|entry| self.touch(entry))
             .ok_or_else(|| {
-                operation_error(
-                    python,
-                    "stale_reference",
-                    "unknown, released, or evicted RNA handle; fetch it again",
-                )
+                let id = reference.get("id").and_then(Value::as_str).unwrap_or("");
+                let message = self.retired.get(id).map_or_else(
+                    || "unknown or released RNA handle; fetch it again".to_owned(),
+                    |why| format!("{why}; fetch it again"),
+                );
+                operation_error(python, "stale_reference", message)
             })
     }
 
@@ -521,7 +581,7 @@ fn infer_locator(value: &Bound<'_, PyAny>) -> PyResult<Arc<Locator>> {
                 owner,
                 path,
                 pointer,
-                durable: is_node_tree_data(value),
+                durable: !is_volatile_data(value),
             }));
         }
         return Err(operation_error(
@@ -694,12 +754,43 @@ fn type_name(value: &Bound<'_, PyAny>) -> String {
         .unwrap_or_else(|_| "object".to_owned())
 }
 
-/// Node-tree data -- nodes, sockets, links, interface items -- is allocated one item at a
-/// time and addressed by name, so geometry and shading updates never move it. Handles to
-/// it survive sub-data invalidation; resolution still re-finds each one from its live
-/// owner and checks its pointer and type. Array-backed data (mesh elements, layers) can
-/// be reallocated with a different element at the same address, so it stays volatile.
-fn is_node_tree_data(value: &Bound<'_, PyAny>) -> bool {
+/// Array-backed or rebuilt data: mesh elements, attribute layers and their values, UV
+/// and colour layers, shape-key and spline points, keyframes, and bones (rebuilt on
+/// leaving edit mode). Blender reallocates these in place, so a *different* element can
+/// appear at the same address; their handles are retired on sub-data invalidation.
+/// Everything else -- IDs' embedded settings (render, view, depth of field), nodes,
+/// sockets, links, modifiers' structs -- is allocated once and never moved, so its
+/// handles stay valid. Either way resolution re-finds the target from its live owner
+/// and checks pointer and type, so no handle can ever reach freed memory.
+fn is_volatile_data(value: &Bound<'_, PyAny>) -> bool {
+    const VOLATILE: [&str; 21] = [
+        "MeshVertex",
+        "MeshEdge",
+        "MeshPolygon",
+        "MeshLoop",
+        "MeshLoopTriangle",
+        "Attribute",
+        "MeshUVLoopLayer",
+        "MeshUVLoop",
+        "MeshLoopColorLayer",
+        "MeshLoopColor",
+        "VertexGroupElement",
+        "ShapeKeyPoint",
+        "ShapeKeyBezierPoint",
+        "ShapeKeyCurvePoint",
+        "SplinePoint",
+        "BezierSplinePoint",
+        "CurvePoint",
+        "Keyframe",
+        "EditBone",
+        "Bone",
+        "PoseBone",
+    ];
+    let name = type_name(value);
+    // Per-element attribute values (FloatAttributeValue, ...) share no base class.
+    if name.ends_with("AttributeValue") || name.ends_with("NormalValue") {
+        return true;
+    }
     let Ok(types) = value
         .py()
         .import("bpy")
@@ -707,14 +798,12 @@ fn is_node_tree_data(value: &Bound<'_, PyAny>) -> bool {
     else {
         return false;
     };
-    ["Node", "NodeSocket", "NodeLink", "NodeTreeInterfaceItem"]
-        .iter()
-        .any(|name| {
-            types
-                .getattr(*name)
-                .and_then(|class| value.is_instance(&class))
-                .unwrap_or(false)
-        })
+    VOLATILE.iter().any(|name| {
+        types
+            .getattr(*name)
+            .and_then(|class| value.is_instance(&class))
+            .unwrap_or(false)
+    })
 }
 
 impl Locator {

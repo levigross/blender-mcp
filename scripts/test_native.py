@@ -543,6 +543,54 @@ class NativeRnaTests(unittest.TestCase):
         finally:
             bpy.data.objects.remove(actual)
 
+    def test_handles_are_durable_unless_array_backed_and_say_why_they_retire(self):
+        # Settings structs embedded in an ID never move; only array-backed elements
+        # (mesh vertices, spline points, bones, ...) can be reallocated in place.
+        scene = self.get(self.context, "scene")
+        render = self.get(scene, "render")
+        camera = bpy.data.cameras.new("MCP durable camera")
+        mesh = bpy.data.meshes.new("MCP volatile mesh")
+        mesh.from_pydata([(0, 0, 0), (1, 0, 0), (0, 1, 0)], [], [(0, 1, 2)])
+        curve = bpy.data.curves.new("MCP volatile curve", "CURVE")
+        curve.splines.new("POLY")
+        armature = bpy.data.armatures.new("MCP volatile armature")
+        try:
+            dof = self.get(self.call(self.get(self.data, "cameras"), "get", camera.name), "dof")
+            vertex = self.items(self.get(self.call(self.get(self.data, "meshes"), "get", mesh.name), "vertices"))[0]
+            points = self.get(self.items(self.get(self.call(self.get(self.data, "curves"), "get", curve.name), "splines"))[0], "points")
+            point = self.items(points)[0]
+
+            self.operations.invalidate_subdata("a test geometry update")
+
+            self.set_value(render, "resolution_percentage", 37)
+            self.assertEqual(bpy.context.scene.render.resolution_percentage, 37)
+            self.set_value(dof, "use_dof", True)
+            self.assertTrue(camera.dof.use_dof)
+            with self.assertRaises(native.OperationError) as raised:
+                self.get(vertex, "co")
+            self.assertEqual(raised.exception.code, "stale_reference")
+            self.assertIn("MeshVertex handle was retired after a test geometry update", str(raised.exception))
+
+            # Adding to an array-backed collection retires its members, and says so.
+            point = self.items(points)[0]
+            self.call(points, "add", 2)
+            with self.assertRaises(native.OperationError) as raised:
+                self.get(point, "co")
+            self.assertIn("retired by `add` on its collection", str(raised.exception))
+
+            # Operators name themselves as the cause.
+            vertex = self.items(self.get(self.call(self.get(self.data, "meshes"), "get", mesh.name), "vertices"))[0]
+            self.execute("operator_call", idname="object.select_all", kwargs={"action": "DESELECT"})
+            with self.assertRaises(native.OperationError) as raised:
+                self.get(vertex, "co")
+            self.assertIn("after operator object.select_all", str(raised.exception))
+            self.set_value(render, "resolution_percentage", 100)
+        finally:
+            bpy.data.cameras.remove(camera)
+            bpy.data.meshes.remove(mesh)
+            bpy.data.curves.remove(curve)
+            bpy.data.armatures.remove(armature)
+
     def test_node_handles_survive_subdata_invalidation(self):
         # Editing a node fires a shading depsgraph update, which marks sub-data dirty.
         # Node-tree data is individually allocated, so its handles must survive that;
@@ -675,10 +723,14 @@ class NativeRnaTests(unittest.TestCase):
             scene = self.get(self.context, "scene")
             self.call(scene, "frame_set", 6)
             self.assertAlmostEqual(self.get(obj, "location")[0], 5.0)
+            keyframe = self.items(points)[0]
             self.assertTrue(
                 self.call(obj, "keyframe_delete", "location", index=0, frame=11)
             )
-            self.assert_code("stale_reference", "rna_items", reference=points["$rna_ref"])
+            # Keyframes are array elements and are retired; the collection handle is
+            # re-found through its F-curve and sees the deletion.
+            self.assert_code("stale_reference", "rna_get", reference=keyframe["$rna_ref"], attribute="co")
+            self.assertEqual(len(self.items(points)), 1)
             action = self.get(self.get(obj, "animation_data"), "action")
             layer = self.items(self.get(action, "layers"))[0]
             strip = self.items(self.get(layer, "strips"))[0]

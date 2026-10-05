@@ -113,8 +113,9 @@ impl BlenderOperations {
         self.references.invalidate()
     }
 
-    fn invalidate_subdata(&mut self) -> usize {
-        self.references.invalidate_subdata()
+    #[pyo3(signature = (cause="an external change"))]
+    fn invalidate_subdata(&mut self, cause: &str) -> usize {
+        self.references.invalidate_subdata(cause)
     }
 
     fn close(&mut self) -> PyResult<()> {
@@ -485,7 +486,8 @@ impl BlenderOperations {
         }
         let positional = PyTuple::new(python, positional)?;
 
-        self.references.invalidate_subdata();
+        self.references
+            .invalidate_subdata(&format!("operator {idname}"));
         let result = with_override(python, override_map.as_ref(), || {
             operator.call(&positional, Some(kwargs))
         })?;
@@ -730,12 +732,14 @@ impl BlenderOperations {
                     | "from_pydata"
             )
         {
-            self.references.invalidate_collection(python, reference)?;
+            self.references
+                .invalidate_collection(python, reference, function)?;
         } else if matches!(
             function,
             "update_from_editmode" | "mode_set" | "keyframe_insert" | "keyframe_delete"
         ) {
-            self.references.invalidate_subdata();
+            self.references
+                .invalidate_subdata(&format!("RNA function {function}"));
         }
         if function == "new" {
             self.references.prune_removed_modifiers(python);

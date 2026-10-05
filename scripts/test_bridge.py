@@ -59,7 +59,7 @@ class FakeOperations:
     def close(self):
         self.closed = True
 
-    def invalidate_subdata(self):
+    def invalidate_subdata(self, cause="an external change"):
         self.subdata_invalidations += 1
 
 

@@ -456,7 +456,7 @@ class BridgeServer:
             self.invalidation_pending = False
             self.subdata_dirty = False
         elif self.subdata_dirty:
-            self.operations.invalidate_subdata()
+            self.operations.invalidate_subdata("a geometry or shading update in Blender")
             self.subdata_dirty = False
 
     def _execute(self, request: dict[str, Any]) -> tuple[Any, Any]:
