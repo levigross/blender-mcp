@@ -48,6 +48,19 @@ cube-count
 Pass `reset: true` to rebuild the environment before evaluating the submitted
 code.
 
+## Working efficiently
+
+- Each bridge call is a round trip to Blender's main thread. Build node graphs with one
+  `node-tree!` call and move mesh data with `collection-read` / `collection-write!`
+  rather than one call per node, socket or vertex.
+- Keep reusable code in files and start the server with `--scheme-library DIR`; then
+  `(use "toolkit")` restores it after a reset or restart.
+- Your MCP client may abandon a call long before `timeout_secs` (Claude Code: about
+  60 s, `MCP_TOOL_TIMEOUT`). The evaluation still finishes; read `previous_abandoned`
+  in the next reply before repeating work.
+- Heavy work on the same machine (a large compile, another Blender) slows the live
+  bridge, which runs on Blender's main thread.
+
 ## Where to read next
 
 - `blender-mcp://reference/stdlib` — the built-in helpers. Start here: they

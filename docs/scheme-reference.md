@@ -35,6 +35,13 @@ on the way to Blender as well as results on the way back, so a single call canno
 carry a large buffer either — a few thousand vertex coordinates already exhausts
 it. Split the work with `(chunk items size)`.
 
+Two more fields appear when they apply. `warnings` lists notes about how the code was
+evaluated, such as a builtin name being redefined. `previous_abandoned` reports, once,
+an earlier evaluation in this session whose client disconnected before it finished:
+its code excerpt, whether it `completed` or `failed`, and its display or error.
+Evaluations are not cancelled when the client goes away; they run to completion,
+bounded by their own `timeout_secs`.
+
 Inspect `structuredContent.result_complete`, `display_truncated`, and
 `serialization_error` before treating a large reply as complete. A failed result
 conversion does not mean Blender rolled back earlier mutations. Per-evaluation
@@ -44,6 +51,8 @@ history omitted earlier entries; at most the last 128 events are retained.
 
 ## Discovery
 
+- `(apropos "node")` lists every global name containing the text: bindings, stdlib
+  helpers, operator aliases and your own definitions.
 - `(operators)` returns every operator ID as a string.
 - `(operator-search "cube")` matches IDs, labels, and descriptions, returning
   `{"total": n, "truncated": bool, "matches": [...]}`. Each match carries
@@ -115,8 +124,27 @@ For call-level options, wrap keyword arguments:
 - `(reference-stats)` and `(reference-release! (list ref ...))` — inspect and release
   retained handles. Reusing a released reference returns `stale_reference`.
 
+- `(prop-get ref "key")`, `(prop-set! ref "key" value)`, `(prop-keys ref)` and
+  `(prop-delete! ref "key")` — custom properties (`obj["key"]` in Python), which glTF
+  exports as `extras`. Keys are 1–63 bytes without a leading `_`; registered add-on
+  properties are refused (use `rna-set!`).
+- `(collection-read coll "attribute" [offset [count]])` — one page of an attribute
+  across a collection (`vertices` `co`, an attribute's `data` `value`, ...):
+  `{"total", "offset", "stride", "values"}`, at most 4,096 values per page.
+- `(collection-write! coll "attribute" offset values)` — overwrite elements from
+  `offset` with flat `values`; the rest is unchanged.
+
 The older `/default` forms remain supported. Square brackets above indicate optional
 arguments, not literal Scheme syntax.
+
+Lists given for flag enums (such as `object.bake` `pass_filter` or
+`tool_settings.snap_elements`) are converted to the sets Blender expects.
+`foreach_get` through `rna-call` returns the buffer it filled.
+
+A `stale_reference` error says why the handle was retired, for example
+`MeshVertex handle was retired after operator object.mode_set: array-backed data may
+have been reallocated`. See `blender-mcp://reference/blender-api` for which handles
+last.
 
 Private attributes, Python expressions, imports, and arbitrary callable access are
 denied. Public RNA functions, collection helpers, and `bpy_struct.keyframe_insert` /
@@ -175,6 +203,18 @@ inverse matrices, mesh topology, materials, and animation curves. Diffs reject
 truncated snapshots. The request journal covers MCP operations only. Checkpoints
 are caller-owned `.blend` files; the server does not rotate or delete them.
 
+## Building geometry and node graphs
+
+- `(mesh-from-data! name vertices faces [collection])` — a mesh object from data, in
+  one call, with every index checked first.
+- `(node-tree! tree spec)` — a whole node graph in one call: interface sockets, nodes
+  upserted by name (properties, then input defaults), and links. Sockets are named by
+  index, by name among enabled sockets, or by identifier; an ambiguous name is an error
+  listing the choices. A failure removes the nodes the call created.
+
+The stdlib builds on both (`expr->nodes`, `expr-into!`, `make-prism`,
+`make-heightfield`, `mesh-positions`, ...); see `blender-mcp://reference/stdlib`.
+
 ## Batches
 
 `(batch! commands)` executes at most 100 typed bridge operations in order. For example:
@@ -185,6 +225,9 @@ are caller-owned `.blend` files; the server does not rotate or delete them.
   (rna-get-command cube "location")))
 ```
 
+`rna-call-command`, `op-call-command` and `prop-set-command` build the other command
+types.
+
 References may use the normal `$rna_ref` wrapper or its inner reference body. The
 bridge yields between commands when its main-thread time slice expires. A batch stops
 at the first error and returns `completed`, indexed `results`, `complete`, and, on
@@ -192,6 +235,14 @@ failure, `failed_index` and `error`. Successful earlier commands remain applied.
 batch is neither a transaction nor a way to bypass per-operation access checks.
 
 ## Long-running work and recovery
+
+MCP clients usually give up on a tool call after a minute or so -- Claude Code after
+about 60 s unless `MCP_TOOL_TIMEOUT` is raised -- independently of `timeout_secs`. When
+that happens the evaluation keeps running and the next reply in the session reports it
+as `previous_abandoned`, so check that before repeating work. Prefer one bridge call
+per job: build graphs with `node-tree!`, move bulk data with `collection-read` /
+`collection-write!`, bake one image channel per call, and use `render-start` for long
+renders.
 
 ```scheme
 (define job (render-start))

@@ -18,26 +18,36 @@ later calls:
 
 Pass `reset: true` to `scheme_eval` to get a clean environment back.
 
-**Change a global with `set!`, not a second `define`.** `set!` updates the binding in
-place, and every function that uses it sees the new value, including functions from
-earlier calls. A second `define` of the same name creates a *new* binding: code
-evaluated afterwards sees it, but functions defined before it keep the old one.
+**Redefining your own names updates their callers.** A top-level `define` of a name
+you defined earlier is compiled as `set!`, so every function that uses it -- including
+functions from earlier calls -- sees the new definition. `set!` works the same way:
 
 ```scheme
 (define speed 1) (define (step) (* speed 2))   ; one call
-(set! speed 5)                                  ; a later call
+(define speed 5)                                ; a later call (or (set! speed 5))
 (step)                                          ; => 10
-(set! step (lambda () 0))                       ; replaces step for its callers too
+(define (step) 0)                               ; replaces step for its callers too
 ```
 
-To wrap an existing function, keep the old value and `set!` the name; reading a name
-and then `define`-ing it in the same call is rejected, and leaves the old definition
-in place:
+Wrapping a function works in one call: the old value is read before it is replaced.
 
 ```scheme
 (define old-step step)
-(set! step (lambda () (+ (old-step) 1)))
+(define (step) (+ (old-step) 1))
 ```
+
+Builtin and stdlib names are the exception: `(define (cos x) ...)` makes a new binding
+that code defined earlier, including the stdlib, does not see, and the reply carries a
+`warnings` entry saying so. Choose another name instead.
+
+**`void` is a value, not a function.** Write `void`, not `(void)`, for Blender's `None`
+(for example `(rna-set! child "parent" void)`).
+
+**Load toolkits with `(use "name")`.** When the server is started with
+`--scheme-library DIR`, a top-level `(use "crossing-toolkit")` loads
+`DIR/crossing-toolkit.scm` in place and returns `"loaded crossing-toolkit (N forms)"`.
+Using it again after editing the file updates existing callers, so a toolkit survives a
+reset or restart with one line. Library files pass the same sandbox checks as your code.
 
 Every top-level expression contributes a value; several expressions return a list of
 them. `define` evaluates to `#<void>`, so a script of definitions returns a row of

@@ -88,6 +88,14 @@ names, and use the returned artifact URIs to read from the correct session.
 See [Shared and independent sessions](docs/sessions.md) for configuration and
 coordination rules.
 
+## Reusable Scheme toolkits
+
+Start the server with `--scheme-library DIR` (or `BLENDER_MCP_SCHEME_LIBRARY`) to let
+sessions load `DIR/name.scm` with `(use "name")`. The directory is read-only to
+clients, names are restricted to letters, digits, `-` and `_`, and loaded code passes
+the same sandbox checks as anything sent to `scheme_eval`. Using a file again after
+editing it updates functions already defined against it.
+
 ## Connecting an MCP client
 
 The server speaks Streamable HTTP, so it must be running before a client

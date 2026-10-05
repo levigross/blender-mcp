@@ -100,18 +100,24 @@ node kind, or object data:
 ; => 0.25
 ```
 
-How long a handle below an ID lasts depends on how Blender stores the data:
+How long a handle below an ID lasts depends on how Blender stores the data. Handles
+are **durable by default**: render and view settings, a camera's depth of field, nodes,
+sockets, links, modifiers and the like are allocated once and never move, so they
+survive operators, mode changes and the depsgraph updates that edits trigger.
 
-- **Node-tree data** — nodes, sockets, links, and group interface items — is allocated
-  one item at a time, so its handles survive operators, mode changes, and the
-  depsgraph updates that editing a node triggers. A node graph can be built across
-  several evaluations. Removing a node through MCP retires every handle to that
-  node and its sockets, but not its siblings, so a loop can remove nodes from a
-  listed collection.
-- **Array-backed data** — mesh vertices, edges, polygons, loops, and layers — can be
-  reallocated with a different element at the same address. Those handles are
-  retired after any operator, mode change, keyframe edit, or geometry update; fetch
-  them again, or better, use `foreach_get`/`foreach_set` on the collection.
+Only **array-backed or rebuilt data** is volatile: mesh vertices, edges, polygons,
+loops and triangles; attribute layers and their values; UV and colour layers;
+vertex-group weights; shape-key and spline points; keyframes; and bones (rebuilt on
+leaving edit mode). Blender can reallocate these with a *different* element at the same
+address, so their handles are retired after any operator, mode change, keyframe edit,
+or geometry update. Fetch them again, or move their values in bulk with
+`collection-read` / `collection-write!`.
+
+Removing a member through MCP retires every handle to it (and to its sockets), but
+not its siblings, so a loop can remove nodes from a listed collection. Adding to an
+array-backed collection retires its members. Every retired handle reports why in its
+`stale_reference` error. Resolution always re-finds the target from its live owner and
+checks its pointer and type, so no handle can reach freed memory.
 
 ## Operators
 
