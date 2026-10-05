@@ -52,20 +52,24 @@ fn scheme_blender_mcp_native(module: &Bound<'_, PyModule>) -> PyResult<()> {
     module.add("__version__", env!("CARGO_PKG_VERSION"))?;
     module.add(
         "CAPABILITIES",
-        (
-            "reference_epochs",
-            "reference_release",
-            "bounded_serialization",
-            "immutable_artifacts",
-            "rna_metadata",
-            "batch",
-            "scene_snapshot",
-            "checkpoint",
-            "mesh_from_data",
-            "id_properties",
-            "thumbnail",
-            "artifact_release",
-        ),
+        pyo3::types::PyTuple::new(
+            module.py(),
+            [
+                "reference_epochs",
+                "reference_release",
+                "bounded_serialization",
+                "immutable_artifacts",
+                "rna_metadata",
+                "batch",
+                "scene_snapshot",
+                "checkpoint",
+                "mesh_from_data",
+                "collection_values",
+                "id_properties",
+                "thumbnail",
+                "artifact_release",
+            ],
+        )?,
     )?;
     module.add("PROTOCOL_VERSION", protocol::protocol_version())?;
     module.add(

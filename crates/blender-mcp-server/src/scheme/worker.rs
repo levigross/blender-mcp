@@ -1015,6 +1015,8 @@ mod tests {
                 (define (render-file! path) path)
                 (define (mesh-from-data! name vertices faces . collection) name)
                 (define (batch! commands) commands)
+                (define (collection-read collection attribute . page) (hash "total" 0 "stride" 0 "values" '()))
+                (define (collection-write! collection attribute offset values) values)
                 "#
                 .to_owned(),
             )
@@ -1206,6 +1208,51 @@ mod tests {
             user_result(&mut engine, "(hand-joints 3)"),
             serde_json::json!(7)
         );
+    }
+
+    #[test]
+    fn collection_values_pages_in_order_and_mesh_helpers_reshape() {
+        // A simulated 2,500-vertex mesh: stride 3, so pages of 1,000 elements.
+        let mut engine = stdlib_engine_with_setup(
+            r#"
+            (define pages-read 0)
+            (define written '())
+            (define (rna-get object key) key)
+            (define (element index) (list index (* 10 index) (* 100 index)))
+            (define (collection-read collection attribute offset count)
+              (set! pages-read (+ pages-read 1))
+              (let* ([total (cond [(equal? collection "vertices") 2500] [(equal? collection "loops") 9] [else 3])]
+                     [end (min total (+ offset count))])
+                (hash "total" total
+                      "stride" (if (equal? attribute "co") 3 1)
+                      "values" (cond [(equal? attribute "co")
+                                      (apply append (map element (range offset end)))]
+                                     [(equal? attribute "loop_start") (list 0 3 6)]
+                                     [(equal? attribute "loop_total") (list 3 3 3)]
+                                     [else (range offset end)]))))
+            (define (collection-write! collection attribute offset values)
+              (set! written (append written (list (list offset (length values))))))"#,
+        );
+        let flat = number_list(&mut engine, "(collection-values \"vertices\" \"co\")");
+        assert_eq!(flat.len(), 7500);
+        assert_eq!(&flat[7497..], &[2499.0, 24_990.0, 249_900.0]);
+        assert_eq!(
+            number_list(&mut engine, "pages-read"),
+            vec![4.0],
+            "a probe and three pages"
+        );
+        let point = number_list(&mut engine, "(list-ref (mesh-positions \"cube\") 1)");
+        assert_eq!(point, vec![1.0, 10.0, 100.0]);
+        let writes = last_json(
+            &mut engine,
+            "(mesh-set-positions! \"cube\" (map element (range 0 2500))) written",
+        );
+        assert_eq!(
+            writes,
+            serde_json::json!([[0, 3000], [1000, 3000], [2000, 1500]])
+        );
+        let faces = last_json(&mut engine, "(mesh-faces \"cube\")");
+        assert_eq!(faces, serde_json::json!([[0, 1, 2], [3, 4, 5], [6, 7, 8]]));
     }
 
     #[test]

@@ -130,6 +130,7 @@ pub(super) fn register_all(
     register_operator_functions(engine, bridge, runtime, deadline, state);
     register_rna_functions(engine, bridge, runtime, deadline, state);
     register_custom_property_functions(engine, bridge, runtime, deadline, state);
+    register_bulk_functions(engine, bridge, runtime, deadline, state);
     register_runtime_functions(engine, bridge, runtime, deadline, state);
     register_workflow_functions(engine, bridge, runtime, deadline, state);
     crate::scheme::math::register_math_functions(engine);
@@ -251,6 +252,62 @@ fn register_operator_functions(
             context_override,
         })
     });
+}
+
+/// Paged bulk access to one attribute across a collection (vertex `co`, ...).
+fn register_bulk_functions(
+    engine: &mut Engine,
+    bridge: &Arc<dyn BlenderBridge>,
+    runtime: &tokio::runtime::Handle,
+    deadline: &EvalDeadline,
+    state: &Arc<BindingState>,
+) {
+    let invoke = Invocation::new(bridge, runtime, deadline, state);
+    register_optional(
+        engine,
+        "collection-read",
+        2,
+        vec![Value::from(0), Value::Null],
+        move |arguments| {
+            let offset = usize::try_from(isize::from_steelval(&arguments[2])?)
+                .map_err(|_| steel_error("collection-read offset must not be negative"))?;
+            let count = match steel_to_json(&arguments[3])? {
+                Value::Null => None,
+                value => Some(
+                    value
+                        .as_u64()
+                        .and_then(|count| usize::try_from(count).ok())
+                        .ok_or_else(|| steel_error("collection-read count must not be negative"))?,
+                ),
+            };
+            invoke.call(BridgeOperation::CollectionRead {
+                reference: parse_reference(&arguments[0])?,
+                attribute: String::from_steelval(&arguments[1])?,
+                offset,
+                count,
+            })
+        },
+    );
+
+    let invoke = Invocation::new(bridge, runtime, deadline, state);
+    engine.register_fn(
+        "collection-write!",
+        move |reference: SteelVal,
+              attribute: String,
+              offset: usize,
+              values: SteelVal|
+              -> Result<SteelVal, SteelErr> {
+            let Value::Array(values) = steel_to_json(&values)? else {
+                return Err(steel_error("collection-write! values must be a flat list"));
+            };
+            invoke.call(BridgeOperation::CollectionWrite {
+                reference: parse_reference(&reference)?,
+                attribute,
+                offset,
+                values,
+            })
+        },
+    );
 }
 
 fn register_custom_property_functions(

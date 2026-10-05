@@ -248,6 +248,9 @@ impl BlenderOperations {
             "batch" => self.batch(python, request),
             "checkpoint" => self.checkpoint(python, request),
             "mesh_from_data" => self.mesh_from_data(python, request),
+            "collection_read" | "collection_write" => {
+                self.collection_values(python, operation, request)
+            }
             "render" => self.render(python, request),
             "thumbnail" => self.thumbnail(python, request),
             "artifact" => self.artifacts.fetch(
@@ -763,9 +766,17 @@ impl BlenderOperations {
         if function == "new" {
             self.references.prune_removed_modifiers(python);
         }
+        // foreach_get fills its buffer argument in place and returns None; return the
+        // buffer so the caller sees the data (bounded like any result).
+        let filled = (function == "foreach_get")
+            .then(|| args.get(1).cloned())
+            .flatten();
         let value = callable.call(PyTuple::new(python, args)?, kwargs.as_ref())?;
         if let Some(pointers) = freed {
             self.references.retire_pointers(&pointers);
+        }
+        if let Some(buffer) = filled {
+            return self.bounded(python, &buffer);
         }
         if is_rna_collection(target) && value.hasattr("bl_rna")? {
             self.references.insert_member(reference, &value)
@@ -940,6 +951,72 @@ impl BlenderOperations {
         Ok(
             json!({"path": filepath, "size": std::fs::metadata(&filepath)?.len(), "generation": self.generation(), "active_filepath": before, "copy": true}),
         )
+    }
+
+    /// Paged bulk access to one attribute of every member of a collection (vertex
+    /// `co`, attribute `value`, UV `uv`, keyframe `co`, ...). Blender's
+    /// `foreach_get`/`foreach_set` always cover the whole collection, so a page reads
+    /// the full buffer and slices it, and a write patches its range back in place.
+    /// Writing values reallocates nothing, so no handle is retired.
+    fn collection_values(
+        &mut self,
+        python: Python<'_>,
+        operation: &str,
+        request: &Value,
+    ) -> PyResult<Value> {
+        let reference = request.get("reference").cloned().unwrap_or(Value::Null);
+        let target = self.references.resolve(python, &reference)?;
+        if !is_rna_collection(&target) {
+            return Err(operation_error(
+                python,
+                "invalid_arguments",
+                "collection-read and collection-write need an RNA collection",
+            ));
+        }
+        let attribute = Self::public_name(python, string_field(request, "attribute"), "attribute")?;
+        let total = target.len()?;
+        let offset = request
+            .get("offset")
+            .and_then(Value::as_u64)
+            .and_then(|value| usize::try_from(value).ok())
+            .unwrap_or(0);
+        if offset > total || (total == 0 && operation == "collection_write") {
+            return Err(operation_error(
+                python,
+                "invalid_arguments",
+                format!("offset {offset} is outside a collection of {total}"),
+            ));
+        }
+        if total == 0 {
+            return Ok(json!({"total": 0, "offset": 0, "stride": 0, "values": []}));
+        }
+        let shape = ElementShape::of(python, &target, attribute)?;
+        let buffer = shape.buffer(python, total)?;
+        target.call_method1("foreach_get", (attribute, &buffer))?;
+        if operation == "collection_read" {
+            let count = request
+                .get("count")
+                .and_then(Value::as_u64)
+                .and_then(|value| usize::try_from(value).ok())
+                .unwrap_or(total - offset)
+                .min(total - offset);
+            let values = shape.page(python, &buffer, offset, count)?;
+            return Ok(
+                json!({"total": total, "offset": offset, "stride": shape.stride, "values": values}),
+            );
+        }
+        let values = array_field(python, request, "values")?;
+        let updated = shape.patch(python, &buffer, offset, values, total)?;
+        target.call_method1("foreach_set", (attribute, &buffer))?;
+        // Meshes need an update to rebuild derived data (normals, bounds).
+        if let Ok(owner) = target.getattr("id_data") {
+            if is_blender_instance(&owner, "Mesh") {
+                owner.call_method0("update")?;
+            } else if owner.hasattr("update_tag")? {
+                owner.call_method0("update_tag")?;
+            }
+        }
+        Ok(json!({"updated": updated, "offset": offset, "stride": shape.stride, "total": total}))
     }
 
     /// `Mesh.from_pydata` is Python-defined, so the RNA sandbox cannot call it; this is
@@ -1387,6 +1464,120 @@ fn custom_property_key<'a>(python: Python<'_>, key: &'a str) -> PyResult<&'a str
         ));
     }
     Ok(key)
+}
+
+/// How one collection member's attribute flattens into a `foreach_get` buffer.
+struct ElementShape {
+    /// Values per element: 3 for a vertex `co`, 1 for a scalar.
+    stride: usize,
+    /// `array` type code for floats or ints; `None` for booleans (a plain list).
+    code: Option<&'static str>,
+}
+
+impl ElementShape {
+    fn of(python: Python<'_>, target: &Bound<'_, PyAny>, attribute: &str) -> PyResult<Self> {
+        let sample = target.get_item(0)?.getattr(attribute)?;
+        if sample.is_instance_of::<PyString>() {
+            return Err(operation_error(
+                python,
+                "invalid_arguments",
+                format!("{attribute} is a string; read it with rna-get"),
+            ));
+        }
+        let (stride, first) = match sample.len() {
+            Ok(length) => (length, sample.get_item(0)?),
+            Err(_) => (1, sample),
+        };
+        let code = if first.is_instance_of::<PyBool>() {
+            None
+        } else if first.is_instance_of::<PyInt>() {
+            Some("i")
+        } else {
+            Some("f")
+        };
+        Ok(Self { stride, code })
+    }
+
+    /// A zeroed buffer for every element, as `foreach_get` expects.
+    fn buffer<'py>(&self, python: Python<'py>, total: usize) -> PyResult<Bound<'py, PyAny>> {
+        let size = total * self.stride;
+        match self.code {
+            Some(code) => python
+                .import("array")?
+                .getattr("array")?
+                .call1((code, vec![0_i32]))?
+                .call_method1("__mul__", (size,)),
+            None => Ok(PyList::new(python, std::iter::repeat_n(false, size))?.into_any()),
+        }
+    }
+
+    fn page(
+        &self,
+        python: Python<'_>,
+        buffer: &Bound<'_, PyAny>,
+        offset: usize,
+        count: usize,
+    ) -> PyResult<Vec<Value>> {
+        if count * self.stride > MAX_SERIALIZED_ITEMS {
+            return Err(operation_error(
+                python,
+                "serialization_limit",
+                format!(
+                    "{count} elements of {} values exceed {MAX_SERIALIZED_ITEMS} per page; request at most {} elements",
+                    self.stride,
+                    MAX_SERIALIZED_ITEMS / self.stride
+                ),
+            ));
+        }
+        (offset * self.stride..(offset + count) * self.stride)
+            .map(|index| py_to_json(&buffer.get_item(index)?))
+            .collect()
+    }
+
+    /// Write `values` into the buffer from element `offset`; returns elements written.
+    fn patch(
+        &self,
+        python: Python<'_>,
+        buffer: &Bound<'_, PyAny>,
+        offset: usize,
+        values: &[Value],
+        total: usize,
+    ) -> PyResult<usize> {
+        if !values.len().is_multiple_of(self.stride) || offset + values.len() / self.stride > total
+        {
+            return Err(operation_error(
+                python,
+                "invalid_arguments",
+                format!(
+                    "{} values do not fill whole elements of {} from offset {offset} within {total}",
+                    values.len(),
+                    self.stride
+                ),
+            ));
+        }
+        for (index, value) in values.iter().enumerate() {
+            let item = match self.code {
+                Some("i") => value
+                    .as_i64()
+                    .map(|number| number.into_pyobject(python).map(Bound::into_any)),
+                Some(_) => value
+                    .as_f64()
+                    .map(|number| number.into_pyobject(python).map(Bound::into_any)),
+                None => value
+                    .as_bool()
+                    .map(|flag| Ok(flag.into_pyobject(python)?.to_owned().into_any())),
+            }
+            .ok_or_else(|| {
+                operation_error(
+                    python,
+                    "invalid_arguments",
+                    format!("value {index} has the wrong type"),
+                )
+            })??;
+            buffer.set_item(offset * self.stride + index, item)?;
+        }
+        Ok(values.len() / self.stride)
+    }
 }
 
 /// Validated `mesh_from_data` input, shaped for `Mesh.from_pydata`.

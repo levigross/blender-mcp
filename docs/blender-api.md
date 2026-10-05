@@ -267,13 +267,21 @@ carry a large buffer either. Vertex coordinates are three numbers each, so a few
 thousand vertices exhausts it, and `foreach_set` uploads fail at exactly the point a
 procedural mesh gets interesting.
 
-Build large geometry in pieces. `(chunk items size)` splits a list, and separate
-chunks can become separate meshes or separate `foreach_set` calls against different
-ranges:
+Move large data in pages instead. Blender's `foreach_get`/`foreach_set` always cover a
+whole collection, so they cannot be split into ranges by hand; `collection-read` and
+`collection-write!` page one attribute of any collection for you, and the stdlib
+builds on them:
 
 ```scheme
-(for-each (lambda (piece) (upload-piece! piece)) (chunk coordinates 2000))
+(mesh-positions obj)                    ; ((x y z) ...), any vertex count
+(mesh-set-positions! obj points)        ; written back 1,000 vertices per call
+(mesh-faces obj)                        ; ((i j k ...) ...)
+(collection-values (rna-get (collection-get (rna-get mesh "attributes") "wet") "data") "value")
+(collection-read (rna-get mesh "vertices") "co" 1000 500) ; one page: total, stride, values
 ```
+
+New geometry is still best built with `mesh-from-data!`, splitting very large meshes
+into several objects with `(chunk items size)`.
 
 ## Cost, and designing around it
 

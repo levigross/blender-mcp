@@ -591,6 +591,51 @@ class NativeRnaTests(unittest.TestCase):
             bpy.data.curves.remove(curve)
             bpy.data.armatures.remove(armature)
 
+    def test_collection_values_page_and_patch_in_place(self):
+        count = 3000
+        mesh = bpy.data.meshes.new("MCP bulk mesh")
+        mesh.from_pydata([(i, 2 * i, 3 * i) for i in range(count)], [], [])
+        try:
+            handle = self.call(self.get(self.data, "meshes"), "get", mesh.name)
+            vertices = self.get(handle, "vertices")
+            ref = vertices["$rna_ref"]
+            page = self.execute("collection_read", reference=ref, attribute="co", offset=1000, count=2)
+            self.assertEqual(page["total"], count)
+            self.assertEqual(page["stride"], 3)
+            self.assertEqual(page["values"], [1000.0, 2000.0, 3000.0, 1001.0, 2002.0, 3003.0])
+            # A full page fits the native budget; one element more does not.
+            self.assertEqual(len(self.execute("collection_read", reference=ref, attribute="co", count=1365)["values"]), 4095)
+            self.assert_code("serialization_limit", "collection_read", reference=ref, attribute="co", count=1366)
+
+            # A ranged write changes only its range.
+            self.execute("collection_write", reference=ref, attribute="co", offset=2998, values=[7, 8, 9, 10, 11, 12])
+            self.assertEqual(tuple(mesh.vertices[2998].co), (7.0, 8.0, 9.0))
+            self.assertEqual(tuple(mesh.vertices[2999].co), (10.0, 11.0, 12.0))
+            self.assertEqual(tuple(mesh.vertices[2997].co), (2997.0, 5994.0, 8991.0))
+
+            # Booleans and integers keep their types.
+            select = self.execute("collection_read", reference=ref, attribute="select", count=2)
+            self.assertEqual(select["stride"], 1)
+            self.assertTrue(all(isinstance(value, bool) for value in select["values"]))
+            self.execute("collection_write", reference=ref, attribute="select", offset=0, values=[True, False])
+            self.assertEqual((mesh.vertices[0].select, mesh.vertices[1].select), (True, False))
+
+            for bad in ({"values": [1, 2]}, {"values": [1, 2, 3], "offset": count}, {"values": ["x", 2, 3]}):
+                self.assert_code("invalid_arguments", "collection_write", reference=ref, attribute="co",
+                                 **{"offset": 0, **bad})
+            self.assert_code("invalid_arguments", "collection_read", reference=self.get(self.data, "meshes")["$rna_ref"], attribute="name")
+
+            # foreach_get through rna_call now returns the buffer it filled.
+            small = bpy.data.meshes.new("MCP foreach mesh")
+            small.from_pydata([(1, 2, 3), (4, 5, 6)], [], [])
+            try:
+                verts = self.get(self.call(self.get(self.data, "meshes"), "get", small.name), "vertices")
+                self.assertEqual(self.call(verts, "foreach_get", "co", [0.0] * 6), [1.0, 2.0, 3.0, 4.0, 5.0, 6.0])
+            finally:
+                bpy.data.meshes.remove(small)
+        finally:
+            bpy.data.meshes.remove(mesh)
+
     def test_flag_enums_accept_lists(self):
         # Scheme and JSON have no sets; flag enums need one. A list used to be passed
         # through as-is and Blender rejected it, e.g. bake pass_filter.

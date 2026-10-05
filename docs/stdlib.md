@@ -283,8 +283,20 @@ The chunk size must be a positive integer.
 
 The 10,000-item budget is spent on arguments travelling **to** Blender as well as on
 results coming back, so one call cannot carry a large buffer. Vertex coordinates are
-three numbers each, so a few thousand vertices exhausts it and a `foreach_set` upload
-fails at exactly the point a procedural mesh gets interesting. Build it in pieces.
+three numbers each, so a few thousand vertices exhausts it. Build new meshes in
+pieces, and read or rewrite existing ones in pages:
+
+```scheme
+(mesh-positions obj)               ; ((x y z) ...) for any vertex count
+(mesh-set-positions! obj points)   ; 1,000 vertices per bridge call
+(mesh-faces obj)                   ; ((i j k ...) ...)
+(collection-values coll "co")      ; any attribute of any collection, flattened
+(collection-read coll "co" 0 500)  ; one page: total, stride, values
+(collection-write! coll "co" 0 (list 0 0 1  1 0 1))
+```
+
+A page holds at most 4,096 values. `foreach_get` through `rna-call` also returns the
+buffer it filled, for collections small enough to read in one call.
 
 `rna-set-command` and `rna-get-command` create typed command hashes for `batch!`:
 

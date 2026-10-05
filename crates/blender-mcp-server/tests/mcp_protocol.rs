@@ -84,6 +84,18 @@ impl BlenderBridge for MockBridge {
                 ..
             } => json!({"name": name, "vertices": vertices, "faces": faces,
                         "collection": collection.map(|reference| reference.id)}),
+            BridgeOperation::CollectionRead {
+                attribute,
+                offset,
+                count,
+                ..
+            } => json!({"attribute": attribute, "offset": offset, "count": count}),
+            BridgeOperation::CollectionWrite {
+                attribute,
+                offset,
+                values,
+                ..
+            } => json!({"attribute": attribute, "offset": offset, "values": values}),
             BridgeOperation::IdPropertySet { key, value, .. } => {
                 json!({"key": key, "value": value})
             }
@@ -578,6 +590,26 @@ async fn build_bindings_send_typed_payloads_and_reject_malformed_geometry() {
         let rejected = evaluate(&server, malformed).await;
         assert_eq!(rejected.is_error, Some(true), "{malformed} should fail");
     }
+
+    let read = evaluate(&server, r#"(collection-read (context-ref) "co" 10 5)"#).await;
+    assert_eq!(
+        structured(&read)["result"],
+        json!({"attribute": "co", "offset": 10, "count": 5})
+    );
+    let whole = evaluate(&server, r#"(collection-read (context-ref) "co")"#).await;
+    assert_eq!(
+        structured(&whole)["result"],
+        json!({"attribute": "co", "offset": 0, "count": null})
+    );
+    let written = evaluate(
+        &server,
+        r#"(collection-write! (context-ref) "co" 2 (list 1.5 2 3))"#,
+    )
+    .await;
+    assert_eq!(
+        structured(&written)["result"],
+        json!({"attribute": "co", "offset": 2, "values": [1.5, 2, 3]})
+    );
 
     let tagged = evaluate(
         &server,

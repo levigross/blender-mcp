@@ -154,6 +154,24 @@ pub enum BridgeOperation {
     Checkpoint {
         filepath: String,
     },
+    /// A page of a collection attribute through `foreach_get`: elements
+    /// `[offset, offset + count)`, flattened (`stride` values per element).
+    CollectionRead {
+        reference: RnaReference,
+        attribute: String,
+        #[serde(default)]
+        offset: usize,
+        #[serde(default)]
+        count: Option<usize>,
+    },
+    /// Overwrite elements starting at `offset` with flattened `values` through
+    /// `foreach_set`, leaving the rest of the collection unchanged.
+    CollectionWrite {
+        reference: RnaReference,
+        attribute: String,
+        offset: usize,
+        values: Vec<Value>,
+    },
     /// Build a mesh object from vertex positions and index lists. `Mesh.from_pydata`
     /// is Python-defined rather than RNA-published, so the RNA sandbox cannot reach it.
     MeshFromData {
@@ -238,6 +256,7 @@ impl BridgeOperation {
             | Self::Thumbnail { .. }
             | Self::Checkpoint { .. }
             | Self::MeshFromData { .. }
+            | Self::CollectionWrite { .. }
             | Self::IdPropertySet { .. }
             | Self::IdPropertyDelete { .. }
             | Self::Shutdown => true,

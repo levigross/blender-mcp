@@ -595,6 +595,47 @@
   (let ([data (heightfield-data columns rows size height-at)])
     (apply mesh-from-data! name (list-ref data 0) (list-ref data 1) collection)))
 
+;; ------------------------------------------------------------------ bulk data
+;;
+;; `collection-read` / `collection-write!` (native) move one attribute of a whole
+;; collection in pages. These page automatically, at most 3,000 values per bridge
+;; call, so a mesh of any size can be read or rewritten.
+
+;; Every value of `attribute` across `collection`, flattened (vertex co: x y z x y z ...).
+(define (collection-values collection attribute)
+  (let* ([probe (collection-read collection attribute 0 1)]
+         [total (hash-ref probe "total")]
+         [page (max 1 (quotient 3000 (max 1 (hash-ref probe "stride"))))])
+    (let loop ([offset 0] [pages '()])
+      (if (>= offset total)
+          (apply append (reverse pages))
+          (loop (+ offset page)
+                (cons (hash-ref (collection-read collection attribute offset page) "values")
+                      pages))))))
+
+;; Vertex positions of a mesh object, ((x y z) ...), in the object's local space.
+(define (mesh-positions object)
+  (chunk (collection-values (rna-get (rna-get object "data") "vertices") "co") 3))
+
+;; Replace vertex positions from ((x y z) ...); the count must match the mesh.
+(define (mesh-set-positions! object points)
+  (let ([vertices (rna-get (rna-get object "data") "vertices")])
+    (let loop ([offset 0] [pieces (chunk points 1000)])
+      (unless (null? pieces)
+        (collection-write! vertices "co" offset (apply append (car pieces)))
+        (loop (+ offset (length (car pieces))) (cdr pieces))))
+    (length points)))
+
+;; Faces as lists of vertex indices, in the order mesh-from-data! takes them.
+(define (mesh-faces object)
+  (let* ([mesh (rna-get object "data")]
+         [starts (collection-values (rna-get mesh "polygons") "loop_start")]
+         [sizes (collection-values (rna-get mesh "polygons") "loop_total")]
+         [corners (list->vector (collection-values (rna-get mesh "loops") "vertex_index"))])
+    (map (lambda (start size)
+           (map (lambda (corner) (vector-ref corners (+ start corner))) (range 0 size)))
+         starts sizes)))
+
 ;; ------------------------------------------------------------------ animation
 
 (define (set-frame! frame) (rna-call (scene) "frame_set" (list frame) (hash)))
