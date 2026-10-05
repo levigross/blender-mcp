@@ -420,6 +420,30 @@ class BridgeTests(unittest.TestCase):
         status = self.rpc(self.request("control_status"))["result"]
         self.assertEqual(status["generation"], 2)
 
+    def test_timer_serves_a_sequential_stream_without_waiting_an_interval(self):
+        # A sequential client sends its next request just after the previous reply.
+        # The tick used to return and come back 20 ms later, so every bridge call cost
+        # a whole interval; now the follow-up is served within the same tick.
+        started = time.monotonic()
+        self.assertEqual(self.server.timer_tick(), bridge.IDLE_INTERVAL)
+        self.assertLess(time.monotonic() - started, bridge.NEXT_REQUEST_WAIT, "an idle tick must not block")
+
+        follow_up = threading.Event()
+
+        def enqueue_next():
+            if not follow_up.is_set():
+                follow_up.set()
+                threading.Timer(0.0005, lambda: self.server._enqueue(self.request("rna_get"))).start()
+
+        self.server.operations.on_execute = enqueue_next
+        self.server._enqueue(self.request("rna_get"))
+        self.assertEqual(self.server.timer_tick(), bridge.BUSY_INTERVAL)
+        self.assertEqual(len(self.server.operations.executed), 2)
+
+        # Once the stream stops, the timer falls back to its idle interval.
+        self.server.last_work = time.monotonic() - bridge.BUSY_LINGER
+        self.assertEqual(self.server.timer_tick(), bridge.IDLE_INTERVAL)
+
     def test_live_stop_unregisters_timer_and_hooks(self):
         server = bridge.start_live(0)
         self.assertTrue(timers.is_registered(server.timer_tick))

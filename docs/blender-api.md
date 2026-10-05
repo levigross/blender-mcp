@@ -288,8 +288,11 @@ in order:
 4. Individual RNA calls where each step depends on the previous result.
 
 Batch execution yields between commands to leave time for Blender's event loop. It stops
-on the first error and reports completed commands; it does not roll them back. Runtime
-latency depends on the Blender mode and current workload. Each evaluation reports
+on the first error and reports completed commands; it does not roll them back. Calls that
+arrive back to back are served without waiting for the dispatcher's next poll: about
+0.6-0.9 ms each in headless mode, where a fixed 10 ms poll used to set the pace. Live
+mode serves such streams in short slices between UI updates. Runtime
+latency still depends on the Blender mode and current workload. Each evaluation reports
 `metrics.bridge_calls` and `metrics.bridge_elapsed_ms`; the `mcp-benchmark` Nix check
 measures equivalent 100- and 1,000-operation scalar/batch read and write workloads
 and writes `result.json`. These CPU headless measurements do not measure live UI

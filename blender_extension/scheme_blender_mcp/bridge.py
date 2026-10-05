@@ -34,6 +34,15 @@ RESULT_BYTES = 1024 * 1024
 REQUEST_BYTES = 2 * 1024 * 1024
 PENDING_REQUEST_BYTES = 16 * 1024 * 1024
 BATCH_SLICE_MS = 20
+# Live dispatch runs inside Blender's timer. A sequential client sends its next
+# request within a fraction of a millisecond of the previous reply, so waiting a full
+# idle interval per request made every bridge call cost ~20 ms. While requests keep
+# arriving, serve them back to back within a slice, then yield briefly to the UI.
+IDLE_INTERVAL = 0.02
+BUSY_INTERVAL = 0.001
+BUSY_SLICE = 0.016
+NEXT_REQUEST_WAIT = 0.002
+BUSY_LINGER = 0.5
 CAPABILITIES = ["request_receipts", "queued_deadlines", "control_status", "render_jobs", "reference_epochs", "batch"]
 
 
@@ -88,6 +97,9 @@ class BridgeServer:
         self.connections = threading.BoundedSemaphore(CONNECTION_LIMIT)
         self.waiters = threading.BoundedSemaphore(WAITER_LIMIT)
         self.stop_event = threading.Event()
+        # Set whenever work is queued, so the dispatcher can wake at once.
+        self.work_available = threading.Event()
+        self.last_work = 0.0
         self.ready = threading.Event()
         self.thread: threading.Thread | None = None
         self.listener: socket.socket | None = None
@@ -361,6 +373,7 @@ class BridgeServer:
             cancelled_early = key in self.early_cancellations
             if not cancelled_early:
                 self.work.put_nowait(item)
+                self.work_available.set()
             self.registry[key] = item
             self.request_count += 1
             self.request_bytes += size
@@ -572,17 +585,28 @@ class BridgeServer:
                 _hooks(False)
             return None
         started = time.monotonic()
-        for _ in range(8):
-            if not self.dispatch_once() or time.monotonic() - started >= 0.02:
+        while time.monotonic() - started < BUSY_SLICE:
+            if self.dispatch_once():
+                self.last_work = time.monotonic()
+            elif time.monotonic() - self.last_work >= BUSY_LINGER or not self.wait_for_work(NEXT_REQUEST_WAIT):
+                # Idle: never hold the main thread waiting for work that is not coming.
                 break
-        return 0.02
+        busy = time.monotonic() - self.last_work < BUSY_LINGER
+        return BUSY_INTERVAL if busy else IDLE_INTERVAL
+
+    def wait_for_work(self, timeout: float) -> bool:
+        """Block up to `timeout` until a request is queued; True if one may be waiting."""
+        self.work_available.clear()
+        if self.active is not None or not self.work.empty():
+            return True
+        return self.work_available.wait(timeout)
 
     def run_headless(self) -> None:
         self.start()
         try:
             while not self.stop_event.is_set():
                 if not self.dispatch_once():
-                    time.sleep(0.01)
+                    self.wait_for_work(0.01)
         finally:
             if self.active is not None:
                 self.dispatch_once()
@@ -632,7 +656,7 @@ def start_live(port: int = 9876) -> BridgeServer:
     _SERVER = server
     try:
         _hooks(True)
-        bpy.app.timers.register(server.timer_tick, first_interval=0.02, persistent=True)
+        bpy.app.timers.register(server.timer_tick, first_interval=IDLE_INTERVAL, persistent=True)
     except BaseException:
         _hooks(False)
         _SERVER = None
