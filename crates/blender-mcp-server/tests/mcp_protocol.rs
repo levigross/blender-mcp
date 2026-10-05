@@ -35,6 +35,9 @@ const BLENDER_VERSION: &str = "5.2.1";
 #[derive(Debug)]
 struct MockBridge;
 
+/// How many times a `ReferenceReset` reached the mock bridge.
+static REFERENCE_RESETS: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+
 #[async_trait]
 impl BlenderBridge for MockBridge {
     async fn request(
@@ -84,6 +87,10 @@ impl BlenderBridge for MockBridge {
                 ..
             } => json!({"name": name, "vertices": vertices, "faces": faces,
                         "collection": collection.map(|reference| reference.id)}),
+            BridgeOperation::ReferenceReset => {
+                REFERENCE_RESETS.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                json!({"generation": 2})
+            }
             BridgeOperation::NodeTreeBuild {
                 clear,
                 interface,
@@ -340,6 +347,8 @@ async fn scheme_state_persists_across_distinct_clients_and_reset_is_visible() {
         .await
         .expect("reset evaluates");
     assert_ne!(reset.is_error, Some(true));
+    // The reset also released the handles Blender held for the old environment.
+    assert!(REFERENCE_RESETS.load(std::sync::atomic::Ordering::SeqCst) >= 1);
     reset_client.cancel().await.expect("client closes");
 
     // A third client sees the rebuilt environment, so the definition is gone.

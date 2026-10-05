@@ -125,6 +125,9 @@ pub enum BridgeOperation {
         references: Vec<RnaReference>,
     },
     ReferenceStats,
+    /// Retire every handle and start a new reference epoch: a Scheme reset leaves no
+    /// value that could still hold one.
+    ReferenceReset,
     Batch {
         requests: Vec<BridgeOperation>,
         #[serde(default = "default_batch_budget")]

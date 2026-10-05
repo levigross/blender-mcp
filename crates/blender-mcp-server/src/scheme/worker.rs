@@ -423,14 +423,20 @@ fn process_request(
             .ok();
         return;
     }
-    if request.reset
-        && let Err(error) = rebuild_engine(engine, bridge, runtime, deadline, state)
-    {
-        request
-            .reply
-            .send(Err(SchemeEvalError::new("reset_failed", error.to_string())))
-            .ok();
-        return;
+    if request.reset {
+        if let Err(error) = rebuild_engine(engine, bridge, runtime, deadline, state) {
+            request
+                .reply
+                .send(Err(SchemeEvalError::new("reset_failed", error.to_string())))
+                .ok();
+            return;
+        }
+        // No Scheme value survives a reset, so neither need the handles it held.
+        if let Err(error) = runtime
+            .block_on(bridge.request(BridgeOperation::ReferenceReset, Duration::from_secs(5)))
+        {
+            warn!(%error, "could not release Blender handles after a reset");
+        }
     }
 
     state.clear_evaluation_output();

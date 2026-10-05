@@ -466,6 +466,9 @@ class BridgeServer:
         finally:
             self.executing_native = False
             self._apply_invalidation()
+            if request.get("operation") == "reference_reset":
+                # The native store started a new epoch; publish it to controls.
+                self.generation = self.operations.generation
 
     def _batch_slice(self, item: WorkItem) -> tuple[str, dict[str, Any]] | None:
         requests = item.request["requests"]

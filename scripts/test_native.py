@@ -98,6 +98,14 @@ class NativeRnaTests(unittest.TestCase):
         finally:
             another.close()
 
+    def test_reference_reset_retires_everything(self):
+        objects = self.get(self.data, "objects")
+        before = self.operations.generation
+        result = self.execute("reference_reset")
+        self.assertNotEqual(result["generation"], before)
+        self.assertEqual(self.execute("reference_stats")["count"], 0)
+        self.assert_code("stale_reference", "rna_items", reference=objects["$rna_ref"])
+
     def test_reference_capacity_and_removed_or_renamed_owners(self):
         # A full store evicts its least recently used handle rather than refusing new
         # work; the evicted handle then reports stale_reference, like any other.

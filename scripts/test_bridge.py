@@ -42,6 +42,9 @@ class FakeOperations:
             raise OperationError("test_failure", "deliberate failure", {"field": "test"})
         if request.get("delay"):
             time.sleep(request["delay"])
+        if request.get("operation") == "reference_reset":
+            self.generation += 1
+            return {"generation": self.generation}, []
         if request.get("operation") == "render":
             return {"artifact": {"id": "frame", "path": "/tmp/frame.png"}}, []
         return {"ok": True}, []
@@ -419,6 +422,14 @@ class BridgeTests(unittest.TestCase):
         self.assertEqual(item.state, "succeeded")
         status = self.rpc(self.request("control_status"))["result"]
         self.assertEqual(status["generation"], 2)
+
+    def test_reference_reset_publishes_the_new_epoch_to_controls(self):
+        # Controls (and the server's expected_generation) read the cached epoch.
+        before = self.server.generation
+        self.server._enqueue(self.request("reference_reset"))
+        self.server.dispatch_once()
+        self.assertEqual(self.server.generation, before + 1)
+        self.assertEqual(self.rpc(self.request("control_status"))["result"]["generation"], before + 1)
 
     def test_timer_serves_a_sequential_stream_without_waiting_an_interval(self):
         # A sequential client sends its next request just after the previous reply.

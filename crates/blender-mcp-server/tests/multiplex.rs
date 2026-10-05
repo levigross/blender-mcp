@@ -35,6 +35,8 @@ struct MockBridge {
     artifact: &'static str,
     entered: Notify,
     release: Semaphore,
+    /// `ReferenceReset` requests received: a reset must reach only its own Blender.
+    resets: std::sync::atomic::AtomicUsize,
 }
 
 impl MockBridge {
@@ -44,6 +46,7 @@ impl MockBridge {
             artifact,
             entered: Notify::new(),
             release: Semaphore::new(0),
+            resets: std::sync::atomic::AtomicUsize::new(0),
         })
     }
 }
@@ -57,6 +60,11 @@ impl BlenderBridge for MockBridge {
     ) -> Result<BridgeResponse, TransportError> {
         let value = match operation {
             BridgeOperation::Status => json!({"instance": self.name}),
+            BridgeOperation::ReferenceReset => {
+                self.resets
+                    .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                json!({"generation": 2})
+            }
             BridgeOperation::OperatorCall { idname, .. } if idname == "test.block" => {
                 self.entered.notify_one();
                 self.release.acquire().await.expect("gate open").forget();
@@ -302,6 +310,8 @@ async fn clients_share_selected_state_and_reset_does_not_cross_sessions() {
         .evaluate(json!({"session": "default", "code": "counter"}))
         .await;
     assert_eq!(structured(&preserved)["result"], 7);
+    let resets = |bridge: &MockBridge| bridge.resets.load(std::sync::atomic::Ordering::SeqCst);
+    assert_eq!((resets(&server.primary), resets(&server.alternate)), (0, 1));
     server.shutdown().await;
 }
 

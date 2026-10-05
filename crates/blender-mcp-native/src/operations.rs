@@ -222,6 +222,10 @@ impl BlenderOperations {
             }
             "status" => self.status(python),
             "reference_stats" => Ok(self.references.stats()),
+            "reference_reset" => {
+                let generation = self.references.invalidate();
+                Ok(json!({ "generation": generation }))
+            }
             "reference_release" => self
                 .references
                 .release(python, array_field(python, request, "references")?),
